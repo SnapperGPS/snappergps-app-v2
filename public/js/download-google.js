@@ -21,34 +21,41 @@
  * Read the upload document uploads/{uploadId}.
  * @param {string} uploadId Upload ID.
  * @returns {Promise<Object|null>} Normalised upload record, or null if the
- *   document does not exist or is not accessible to this anonymous user.
+ *   document does not exist. Throws if the read itself fails (e.g. a
+ *   permission-denied from the security rules or App Check, or a network
+ *   error), so the caller can tell the two cases apart.
  */
 async function getUploadStatus(uploadId) {
 
     await ensureAnonymousUser();
     await initialiseAppCheckIfConfigured();
 
+    let snapshot;
+
     try {
 
-        const snapshot = await firebaseDb.collection('uploads').doc(uploadId).get();
-
-        if (!snapshot.exists) {
-
-            return null;
-
-        }
-
-        return normaliseUploadDoc(snapshot.data(), uploadId);
+        snapshot = await firebaseDb.collection('uploads').doc(uploadId).get();
 
     } catch (err) {
 
-        // permission-denied and network errors look the same to the user:
-        // the upload cannot be viewed from this browser.
-        console.warn('Could not read upload ' + uploadId + ': ' + err.message);
+        // Examples:
+        //   permission-denied  -> security rules deny the read (rules not
+        //                         deployed?) or App Check enforcement rejects
+        //                         the request (bad site key / domain?)
+        //   unavailable        -> network problem
+        console.warn('Could not read upload ' + uploadId + ' (' + (err.code || 'error') + '): ' + err.message);
+
+        throw err;
+
+    }
+
+    if (!snapshot.exists) {
 
         return null;
 
     }
+
+    return normaliseUploadDoc(snapshot.data(), uploadId);
 
 }
 

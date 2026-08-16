@@ -62,6 +62,7 @@ clearButton.addEventListener('click', () => {
 
     const urlParams = new URLSearchParams(window.location.search);
     const errorUploadID = urlParams.get('error');
+    const reason = urlParams.get('reason');
 
     if (errorUploadID) {
 
@@ -70,9 +71,29 @@ clearButton.addEventListener('click', () => {
         if (errorDisplay) {
 
             const errorText = document.getElementById('error-text');
-            errorText.innerHTML = 'We could not find any data with your ' +
-                                  'upload ID <i>' + errorUploadID + '</i>. ' +
-                                  'Please double check and try again.';
+
+            if (reason === 'permission') {
+
+                errorText.innerHTML = 'Your upload <i>' + errorUploadID + '</i> could not be read: ' +
+                    'this browser does not have permission to view it. If the track was just ' +
+                    'migrated or uploaded from another browser, make sure the Firebase security ' +
+                    'rules are deployed (firestore.rules and storage.rules, e.g. ' +
+                    '<i>firebase deploy --only firestore:rules,storage</i>) and that App Check ' +
+                    'enforcement is not rejecting this browser.';
+
+            } else if (reason === 'error') {
+
+                errorText.innerHTML = 'We could not read the data for your upload ID <i>' +
+                    errorUploadID + '</i>. Please check your internet connection and try again.';
+
+            } else {
+
+                errorText.innerHTML = 'We could not find any data with your ' +
+                                      'upload ID <i>' + errorUploadID + '</i>. ' +
+                                      'Please double check and try again.';
+
+            }
+
             errorDisplay.style.display = '';
 
         }

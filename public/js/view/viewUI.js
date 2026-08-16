@@ -1025,9 +1025,10 @@ if (!uploadID) {
 
         if (!upload) {
 
-            // The upload does not exist or is not accessible from this
-            // browser: redirect to the search page with the old error message.
-            window.location.href = 'search.html?error=' + encodeURIComponent(uploadID);
+            // The upload document does not exist: redirect to the search
+            // page with the old error message.
+            window.location.href = 'search.html?error=' + encodeURIComponent(uploadID) +
+                                   '&reason=notfound';
             return;
 
         }
@@ -1148,6 +1149,18 @@ if (!uploadID) {
                 processingWarningText.innerHTML = 'Your data upload did not complete. Please try again.';
             }
         }
+
+    }).catch((err) => {
+
+        // The upload document could not be read at all (permission-denied
+        // from the security rules / App Check, or a network error): redirect
+        // to the search page with a specific reason so the user can act.
+        console.warn('Could not load upload ' + uploadID + ':', err);
+
+        const reason = (err && err.code === 'permission-denied') ? 'permission' : 'error';
+
+        window.location.href = 'search.html?error=' + encodeURIComponent(uploadID) +
+                               '&reason=' + reason;
 
     });
 
