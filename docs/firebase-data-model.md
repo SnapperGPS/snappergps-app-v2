@@ -117,6 +117,30 @@ selected date range), exactly like the old app. It loads
 therefore not required to be a subsample; the migration script writes the
 full positions into it as well.
 
+**Bucket CORS.** The download page reads the result objects with `fetch()`
+from the browser origin (GitHub Pages). Cloud Storage does not send
+`Access-Control-Allow-Origin` headers unless a CORS configuration exists on
+the bucket, so the bucket must be configured once, e.g.:
+
+```json
+[
+  {
+    "origin": ["https://<your-pages-host>", "http://localhost:8080"],
+    "method": ["GET", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Content-Encoding", "Content-Length", "Cache-Control"],
+    "maxAgeSeconds": 3600
+  }
+]
+```
+
+```shell
+gsutil cors set cors.json gs://snappergps-prod-data.firebasestorage.app
+```
+
+(`"origin": ["*"]` is acceptable because result objects are publicly
+readable.) After changing the configuration, clear the browser cache once —
+a previously cached CORS-blocked response can otherwise keep failing.
+
 ---
 
 ## 3. Status state machine

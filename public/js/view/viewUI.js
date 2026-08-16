@@ -1067,12 +1067,23 @@ if (!uploadID) {
 
         } catch (err) {
 
-            // Neither the full result object nor the preview is available
-            // (e.g., the results expired, see the retention policy).
+            // Neither the full result object nor the preview could be
+            // downloaded. A TypeError means the request itself was blocked
+            // (CORS on the storage bucket, or being offline), while an
+            // explicit "Could not download" error means the object is really
+            // gone (e.g., it expired, see the retention policy).
             console.warn(err);
+
+            const blockedByCors = (err instanceof TypeError);
+
             processingWarningDisplay.style.display = '';
-            processingWarningText.innerHTML = 'The result of this upload is no longer available. ' +
-                'The metadata is still shown below.';
+            processingWarningText.innerHTML = blockedByCors
+                ? 'The result of this upload could not be downloaded from the cloud. ' +
+                  'This is usually caused by a missing CORS configuration on the ' +
+                  'storage bucket or by being offline. Check the browser console ' +
+                  'for details, then try again.'
+                : 'The result of this upload is no longer available. ' +
+                  'The metadata is still shown below.';
             downloadSpinner.style.display = 'none';
             return;
 
