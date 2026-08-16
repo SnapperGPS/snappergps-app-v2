@@ -128,7 +128,7 @@ if (localStorage.getItem('pointList') !== null) {
     map.setView([0, 0], 1);
 
     // Display warning message
-    warningText.innerHTML = 'No track to display. Go to the <a class="text-link" href="view.html">download page</a> and select a track.';
+    warningText.innerHTML = 'No track to display. Go to the <a class="text-link" href="search.html">download page</a> and select a track.';
     warningDisplay.style.display = '';
 }
 

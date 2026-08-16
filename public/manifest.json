@@ -40,7 +40,7 @@
         },
         {
             "name": "Download",
-            "url": "./view.html",
+            "url": "./search.html",
             "description": "View and download the track of your SnapperGPS receiver once processing is completed"
         }
     ],
