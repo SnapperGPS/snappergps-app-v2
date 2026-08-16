@@ -109,6 +109,14 @@ The raw object is a gzip JSON file with format `snappergps.raw-upload.v1`
 (see `public/js/upload-google.js`), containing the snapshots, the reference
 points, and the processing options.
 
+**Map display uses all positions.** The download page renders every position
+on the map (with the old filtering: confidence-based plausibility and the
+selected date range), exactly like the old app. It loads
+`results/{uploadId}/positions.geojson.gz` and only falls back to
+`preview.geojson` if the full object is unavailable. `preview.geojson` is
+therefore not required to be a subsample; the migration script writes the
+full positions into it as well.
+
 ---
 
 ## 3. Status state machine

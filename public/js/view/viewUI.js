@@ -221,10 +221,9 @@ function geojsonToPositions(geojson) {
 }
 
 /**
- * Load the preview track (results/{uploadId}/preview.geojson) for the map.
- * The preview is a simplified/subsampled version of the full result so that
- * the browser does not need to download a large object just to show the
- * track.
+ * Load the preview track (results/{uploadId}/preview.geojson). The preview
+ * may contain a subsample of the positions, so it is only used as a
+ * fallback for the map when the full result object is not available.
  * @returns {Promise<Array>} Positions array.
  */
 async function loadPreviewPositions() {
@@ -237,20 +236,55 @@ async function loadPreviewPositions() {
 
 }
 
+// Cache of the full positions (used for the map and the KML/JSON download
+// buttons), so the large result object is downloaded at most once per page.
+let fullPositionsCache = null;
+
 /**
  * Download and parse the FULL result object
- * (results/{uploadId}/positions.geojson.gz). Used by the KML/JSON download
- * buttons which should contain all position estimates, not just the preview.
+ * (results/{uploadId}/positions.geojson.gz).
  * @returns {Promise<Array>} Positions array.
  */
 async function loadFullPositions() {
+
+    if (fullPositionsCache !== null) {
+
+        return fullPositionsCache;
+
+    }
 
     const blob = await fetchResultBlob(uploadID, 'positions.geojson.gz');
     const plain = await gunzipBlob(blob);
     const text = await plain.text();
     const geojson = JSON.parse(text);
 
-    return geojsonToPositions(geojson);
+    fullPositionsCache = geojsonToPositions(geojson);
+
+    return fullPositionsCache;
+
+}
+
+/**
+ * Load the positions to display on the map: ALL positions, like the old
+ * app (the map then applies the old filtering, i.e. the confidence-based
+ * plausibility check and the selected date range). Prefers the full result
+ * object and falls back to the preview only if the full object is not
+ * available (e.g., it expired).
+ * @returns {Promise<Array>} Positions array.
+ */
+async function loadMapPositions() {
+
+    try {
+
+        return await loadFullPositions();
+
+    } catch (err) {
+
+        console.warn('Could not load the full result object, falling back to the preview: ' + err.message);
+
+        return loadPreviewPositions();
+
+    }
 
 }
 
@@ -1022,32 +1056,33 @@ if (!uploadID) {
 
         }
 
-        // Load the preview track from Cloud Storage
-        // (results/{uploadId}/preview.geojson).
-        let previewPositions;
+        // Load ALL positions for the map from Cloud Storage (like the old
+        // app), preferring the full result object.
+        let mapPositions;
 
         try {
 
-            previewPositions = await loadPreviewPositions();
+            mapPositions = await loadMapPositions();
 
         } catch (err) {
 
-            // The result objects may have expired (see retention policy).
+            // Neither the full result object nor the preview is available
+            // (e.g., the results expired, see the retention policy).
             console.warn(err);
             processingWarningDisplay.style.display = '';
-            processingWarningText.innerHTML = 'The full result of this upload is no longer available. ' +
+            processingWarningText.innerHTML = 'The result of this upload is no longer available. ' +
                 'The metadata is still shown below.';
             downloadSpinner.style.display = 'none';
             return;
 
         }
 
-        positions = previewPositions;
+        positions = mapPositions;
 
         processedPositionCount = positions.length;
 
         // Remember raw positions for the smoothing feature
-        raw_positions = JSON.parse(JSON.stringify(previewPositions));
+        raw_positions = JSON.parse(JSON.stringify(mapPositions));
 
         const disableButtons = (processedPositionCount === null ||
                                 processedPositionCount === 0);
