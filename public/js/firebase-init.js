@@ -113,24 +113,40 @@ async function getFirebaseIdToken() {
  * configured. The App Check SDK is loaded lazily from gstatic so that pages
  * that never touch Firestore/Storage (e.g., Configure) stay lightweight.
  * Call this before the first Firestore/Storage request.
+ *
+ * The compat SDK is initialised with firebase.appCheck().activate(provider),
+ * NOT with the modular initializeAppCheck() function.
  * @returns {Promise<void>}
  */
 async function initialiseAppCheckIfConfigured() {
 
-    if (!RECAPTCHA_ENTERPRISE_SITE_KEY || firebase.appCheck) {
+    if (!RECAPTCHA_ENTERPRISE_SITE_KEY || (typeof firebase !== 'undefined' && firebase.appCheck)) {
 
         return;
 
     }
 
-    await loadScript('https://www.gstatic.com/firebasejs/12.0.0/firebase-app-check-compat.js');
+    try {
 
-    firebase.initializeAppCheck(firebaseApp, {
-        provider: new firebase.appCheck.ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
-        isTokenAutoRefreshEnabled: true
-    });
+        await loadScript('https://www.gstatic.com/firebasejs/12.0.0/firebase-app-check-compat.js');
 
-    console.log('Firebase App Check initialised.');
+        // Compat SDK: the provider classes live on the firebase.appCheck
+        // namespace and the App Check service is activated per app.
+        firebase.appCheck().activate(
+            new firebase.appCheck.ReCaptchaEnterpriseProvider(RECAPTCHA_ENTERPRISE_SITE_KEY),
+            true // isTokenAutoRefreshEnabled
+        );
+
+        console.log('Firebase App Check initialised.');
+
+    } catch (err) {
+
+        // A misconfigured site key must not break the whole page. Without
+        // App Check tokens, requests are only rejected once enforcement is
+        // enabled in the Firebase console.
+        console.warn('Could not initialise Firebase App Check: ' + err.message);
+
+    }
 
 }
 
