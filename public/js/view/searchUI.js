@@ -1,6 +1,12 @@
 /****************************************************************************
  * searchUI.js
- * March 2021
+ * March 2021 (updated for the static GitHub Pages site)
+ *
+ * Search page: enter an upload ID to view the track, and show the most
+ * recent uploads of this browser/session (stored in localStorage). If the
+ * view page cannot read an upload (not found, or belonging to another
+ * browser), it redirects back here with ?error=<uploadID> and the error is
+ * displayed, exactly like the old server-rendered search page.
  *****************************************************************************/
 
 const idInput = document.getElementById('id-input');
@@ -26,7 +32,7 @@ function searchId() {
 
     // Redirect to page which will contain upload information if it exists
 
-    window.location.href = '/view?uploadid=' + id;
+    window.location.href = 'view.html?uploadid=' + id;
 
 }
 
@@ -49,6 +55,31 @@ clearButton.addEventListener('click', () => {
     uploadTableRow.style.display = 'none';
 
 });
+
+// If the view page redirected back with an error, show it.
+
+(function displayErrorFromUrl() {
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const errorUploadID = urlParams.get('error');
+
+    if (errorUploadID) {
+
+        const errorDisplay = document.getElementById('error-display');
+
+        if (errorDisplay) {
+
+            const errorText = document.getElementById('error-text');
+            errorText.innerHTML = 'We could not find any data with your ' +
+                                  'upload ID <i>' + errorUploadID + '</i>. ' +
+                                  'Please double check and try again.';
+            errorDisplay.style.display = '';
+
+        }
+
+    }
+
+})();
 
 // Call async function that displays upload IDs in table
 
@@ -78,7 +109,7 @@ async function displayUploadIDs() {
 
             const tableRow = uploadTable.insertRow();
             const linkCell = tableRow.insertCell(0);
-            linkCell.innerHTML = '<a class="text-link" href="/view?uploadid=' + upload[0] + '">' + upload[0] + '</a>';
+            linkCell.innerHTML = '<a class="text-link" href="view.html?uploadid=' + upload[0] + '">' + upload[0] + '</a>';
             const nicknameCell = tableRow.insertCell(1);
             nicknameCell.textContent = upload[1];
 

@@ -1,13 +1,17 @@
 /****************************************************************************
  * uploadUI.js
- * March 2021
+ * March 2021 (updated for the Firebase/Google data plane)
+ *
+ * Handles the upload page: WebUSB device pairing, transferring raw data to
+ * the host computer (offline-capable), and uploading recordings to the
+ * cloud. Uploads now go through upload-google.js (one gzip object per
+ * recording + Firestore metadata) instead of the old per-snapshot HTTP
+ * POSTs to the Node/Express backend.
  *****************************************************************************/
 
-/* global L, Blob, startUpload, addReferencePoint, uploadSnapshot, finishUpload, cancelUpload, device, getDeviceInformation, requestDevice, setDisconnectFunction, resetDeviceInfo, connectToDevice, isDeviceAvailable, updateCache, snapshotCountSpan, deviceIDSpan, deviceID, AM_USB_MSG_TYPE_GET_INFO */
+/* global L, Blob, device, getDeviceInformation, requestDevice, setDisconnectFunction, resetDeviceInfo, connectToDevice, isDeviceAvailable, snapshotCountSpan, deviceIDSpan, deviceID, firmwareDescription, firmwareVersion, AM_USB_MSG_TYPE_GET_INFO, uploadSnapperData, uploadPendingRecord, savePendingUpload, listPendingUploads, deletePendingUpload, getPushSubscriptionJson, getCurrentPushSubscriptionJson, formatNextAvailableAt, dateFromInputs, timezoneLabel, showErrorMessage */
 
 const mapboxAccessToken = 'pk.eyJ1Ijoiamdyb3Nza3JldXoiLCJhIjoiY2tseWIxNTRoMHFvODJxbHlyanRobzBmZiJ9.xz2KrKBy5MRCf9XLOOPdzA';
-
-const vapidPublicKey = 'BE20bzDq0YubQSxrJ2ekzU1g9rsmv7I2ZCqqwS7mO2GV0kgPJZjvQ6a04TRUMoeZ33JioQ8S0WhX7ZwpESO4sEs';
 
 const USE_MAX_VELOCITY = true;
 
@@ -94,6 +98,9 @@ const velocityUnitInput = document.getElementById('velocity-unit-input');
 
 // Uplaod nickname
 const nicknameInput = document.getElementById('nickname-input');
+
+// Container for the list of locally saved (pending) transfers
+const pendingUploadsContainer = document.getElementById('pending-uploads-container');
 
 // Length of one snapshot in bytes
 const SNAPSHOT_BUFFER_SIZE = 0x1800; // On device (6 KB)
@@ -451,14 +458,7 @@ const updateTimezone = (inputIndex) => {
             console.log('Problem with input date, trying to fix it...');
             dt = new Date(dateInputs[inputIndex].value.replace(/-/g, '/') + ' ' + timeString);
         }
-        let mins = dt.getTimezoneOffset();
-        const sign = mins <= 0 ? '+' : '-';
-        mins = Math.abs(mins);
-        let h = Math.floor(mins / 60);
-        let m = mins % 60;
-        h = h < 10 ? '0' + h : h;
-        m = m < 10 ? '0' + m : m;
-        timezones[inputIndex].innerHTML = `UTC${sign}${h}:${m}`;
+        timezones[inputIndex].innerHTML = timezoneLabel(dt);
 
     } else {
 
@@ -555,134 +555,89 @@ function setSelectedUploading(isUploading) {
  */
 function createReferencePointJSON(latInput, lngInput, dt) {
 
-    return { lat: parseFloat(latInput.value), lng: parseFloat(lngInput.value), dt: dt };
+    return { lat: parseFloat(latInput.value), lng: parseFloat(lngInput.value), datetime: dt };
 
 }
 
 /**
- * Asynchronously read snapshot from USB buffer and upload it together with meta data.
- * Do not invoke this function too often in parallel, e.g., for all
- * (potentially 11,000) snapshots. Instead, cap the maximum number of
- * instances running at the same time with processDevice2ServerQueue().
- * @param {string}      uploadID Unique ID returned by startUpload().
- * @param {object}      meta Meta data object.
- * @param {ArrayBuffer} data Byte array returned from receiver after requesting meta data.
- * @return {Promise}
- */
-async function getSnapshotDevice(uploadID, meta, data) {
+   * Meta data object.
+   * @param  {ArrayBuffer}  data Byte array returned from receiver after requesting meta data.
+   * @return {Object}       meta Meta data object
+   *    @return {Date}      meta.timestamp Timestamp of snapshot
+   *    @return {Number}    meta.temperature Temperature measurement in degrees Celsius
+   *    @return {Number}    meta.battery Battery voltage measurement in volts
+   */
+function MetaData(data) {
 
-    return new Promise((resolve) => {
+    // Get timestamp of snapshot
+    const seconds = data.getUint8(2) + 256 * (data.getUint8(3) + 256 * (data.getUint8(4) + 256 * data.getUint8(5)));
+    const milliseconds = Math.round((data.getUint8(6) + 256 * data.getUint8(7)) / 1024 * 1000);
+    this.timestamp = new Date(seconds * 1000 + milliseconds);
 
-        // Initialize the snapshot to upload with zeros.
-        // If the incoming data is shorter than the desired length,
-        // then this applies zero padding.
-        const snapshotBuffer = new Uint8Array(SNAPSHOT_SIZE).fill(0);
+    // Convert tenths of degrees Celsius to degrees Celsius
+    this.temperature = (data.getUint8(10) + 256 * (data.getUint8(11) + 256 * (data.getUint8(12) + 256 * data.getUint8(13))) - 1024) / 10.0;
 
-        // Loop over buffer that has been transmitted via USB
-        for (let snapshotBufferIdx = 0;
-            snapshotBufferIdx < SNAPSHOT_BUFFER_SIZE - METADATA_SIZE;
-            ++snapshotBufferIdx) {
-
-            // Write received byte to buffer
-            snapshotBuffer[snapshotBufferIdx] = data.getUint8(snapshotBufferIdx);
-
-        }
-
-        console.log('Uploading file');
-
-        const snapshotBlob = new Blob([snapshotBuffer], { type: 'application/octet-stream' });
-
-        resolve(uploadSnapshot(uploadID, snapshotBlob, meta.timestamp, meta.battery, 1, 1, meta.temperature));
-
-    });
+    // Convert hundreds of volts to volts
+    this.battery = (data.getUint8(14) + 256 * (data.getUint8(15) + 256 * (data.getUint8(16) + 256 * data.getUint8(17)))) / 100.0;
 
 }
-
-// Queue for snapshots that still have to be uploaded.
-var device2ServerQueue;
-
-// Boolean indicating if the queue processor is currently running.
-var isProcessing = false;
-
-// Index of the snapshot in the queue that shall be processed next.
-var taskIndex;
-
-// Indicator if all snapshots have been pushed into queue.
-var isQueueFull = false;
 
 /**
- * Upload max 4 snapshots from device in parallel.
- * Asynchronously process tasks from the device2Server queue, but make sure
- * that only max 4 tasks are running in parallel. Terminate once all tasks in
- * queue are completed.
+ * Convert a snapshot buffer (Uint8Array) to a base64 string.
+ * @param {Uint8Array} snapshotBuffer Raw snapshot bytes.
+ * @returns {string} Base64-encoded snapshot data.
  */
-async function processDevice2ServerQueue(maxNumOfWorkers = 4) {
+function snapshotBufferToBase64(snapshotBuffer) {
 
-    // No worker is active when queue processor is started.
-    var numOfWorkers = 0;
+    let binary = '';
 
-    // Indicate that queue processor is running.
-    isProcessing = true;
+    const chunkSize = 0x8000;
 
-    return new Promise(resolve => {
+    for (let i = 0; i < snapshotBuffer.length; i += chunkSize) {
 
-        const handleResult = index => result => {
+        binary += String.fromCharCode.apply(null, snapshotBuffer.subarray(i, i + chunkSize));
 
-            // Could store success/fail boolean in array here: array[index] = result
-            if (!result) {
+    }
 
-                displayError('We could not upload at least one of your snapshots. You might want to unplug and reconnect your SnapperGPS receiver and try again.');
-
-            }
-            // Update UI
-            snapshotCountLabelUpload.innerHTML = `${index + 1} snapshots uploaded.`;
-            // Worker uploaded snapshot and is now idle
-            numOfWorkers--;
-            // Find new task for worker
-            getNextTask();
-
-        };
-
-        const getNextTask = () => {
-
-            const currentIndex = taskIndex;
-            // Check if a worker is idle and there are elements in the queue
-            if (numOfWorkers < maxNumOfWorkers && currentIndex < device2ServerQueue.length) {
-
-                // Move on to next snapshot in queue
-                taskIndex++;
-                // Indicate that one more worker is busy
-                numOfWorkers++;
-                // Asynchronously process next snapshot in queue
-                getSnapshotDevice(device2ServerQueue[currentIndex].uploadID,
-                    device2ServerQueue[currentIndex].meta,
-                    device2ServerQueue[currentIndex].data
-                ).then(handleResult(currentIndex)).catch(handleResult(currentIndex));
-                // Move on to next snapshot in queue
-                getNextTask();
-
-            } else if (numOfWorkers === 0 && currentIndex === device2ServerQueue.length) {
-
-                // All workers are idel and queue is empty; stop queue processor
-                isProcessing = false;
-                resolve(); // Could return array of success/fail booleans here: resolve(array)
-
-            }
-
-        };
-        // Start processing first snapshot in queue
-        getNextTask();
-
-    });
+    return btoa(binary);
 
 }
 
-var earliestDate, latestDate;
+/**
+ * Build the array of snapshots in the raw upload format from a list of
+ * meta data objects and snapshot buffers read from the receiver.
+ * @param {Array} metaList Array of MetaData objects.
+ * @param {Array} bufferList Array of Uint8Array snapshot buffers.
+ * @returns {Array} Snapshots in raw upload format.
+ */
+function buildRawSnapshots(metaList, bufferList) {
+
+    const snapshots = [];
+
+    for (let i = 0; i < metaList.length; ++i) {
+
+        const meta = metaList[i];
+
+        snapshots.push({
+            i: i,
+            datetime: meta.timestamp.toISOString(),
+            battery: meta.battery,
+            hxfoCount: 1,
+            lxfoCount: 1,
+            temperature: meta.temperature,
+            dataBase64: snapshotBufferToBase64(bufferList[i])
+        });
+
+    }
+
+    return snapshots;
+
+}
 
 /**
  * React to upload button being clicked by attempting to upload data from connected device
  */
-function onDeviceUploadButtonClick() {
+async function onDeviceUploadButtonClick() {
 
     snapshotCountLabelUpload.innerHTML = '0 snapshots uploaded.';
 
@@ -710,16 +665,103 @@ function onDeviceUploadButtonClick() {
 
     setDeviceUploading(true);
 
-    // Start upload by requesting the server create an upload instance in the database, returning its ID
+    // Messages to communicate to device via USB
+    const requestMetaDataMessage = new Uint8Array([AM_USB_MSG_TYPE_GET_SNAPSHOT]);
+    const requestSnapshotMessage = new Uint8Array([AM_USB_MSG_TYPE_GET_SNAPSHOT_PAGE]);
 
-    startUpload(deviceID, email, subscriptionJson, maxVelocity, nickname, async (err, uploadID) => {
+    // Keep reading data from device until all snapshots are read
+    let keepReading = true;
 
-        if (err) {
+    let latestDate = null;
+    let earliestDate = null;
 
-            console.error('Upload failed');
+    // Collect all meta data and snapshot buffers from the receiver.
+    // They are compressed and uploaded as ONE object afterwards.
+    const metaList = [];
+    const bufferList = [];
 
-            errorCard.style.display = '';
-            errorText.innerHTML = err;
+    while (keepReading) {
+
+        try {
+
+            console.log('Request meta data.');
+            // Request to start reading new record from flash memory, start with meta data
+            let result = await device.transferOut(0x01, requestMetaDataMessage);
+
+            console.log('Wait for meta data.');
+            // Wait until meta data is returned
+            result = await device.transferIn(0x01, 128);
+
+            const data = result.data;
+
+            // Check if device has sent data
+            // Device uses 2nd byte of transmit buffer as valid flag
+            if (data.getUint8(1) !== 0x00) {
+
+                console.log('Extract time stamp.');
+
+                const meta = new MetaData(data);
+
+                console.log(meta);
+
+                if (!latestDate || meta.timestamp > latestDate) {
+
+                    latestDate = meta.timestamp;
+
+                }
+
+                if (!earliestDate || meta.timestamp < earliestDate) {
+
+                    earliestDate = meta.timestamp;
+
+                }
+
+                console.log('Start reading snapshot.');
+
+                console.log('Requesting snapshot');
+
+                // Send message to device to request next piece of snapshot
+
+                let result = await device.transferOut(0x01, requestSnapshotMessage);
+
+                console.log('Waiting for snapshot');
+                result = await device.transferIn(0x01, SNAPSHOT_BUFFER_SIZE - METADATA_SIZE);
+
+                // Initialize the snapshot with zeros.
+                // If the incoming data is shorter than the desired length,
+                // then this applies zero padding.
+                const snapshotBuffer = new Uint8Array(SNAPSHOT_SIZE).fill(0);
+
+                // Loop over buffer that has been transmitted via USB
+                for (let snapshotBufferIdx = 0;
+                    snapshotBufferIdx < SNAPSHOT_BUFFER_SIZE - METADATA_SIZE;
+                    ++snapshotBufferIdx) {
+
+                    // Write received byte to buffer
+                    snapshotBuffer[snapshotBufferIdx] = result.data.getUint8(snapshotBufferIdx);
+
+                }
+
+                metaList.push(meta);
+                bufferList.push(snapshotBuffer);
+
+                snapshotCountLabelUpload.innerHTML = `${metaList.length} snapshots read.`;
+
+            } else {
+
+                // All snapshot data has been read from flash
+
+                keepReading = false;
+
+            }
+
+        } catch (err) {
+
+            // Stop reading if USB communication failed
+
+            console.error(err);
+
+            displayError('We could not read all data from your SnapperGPS receiver. You might want to unplug and reconnect it and try again.');
 
             setDeviceUploading(false);
 
@@ -727,360 +769,175 @@ function onDeviceUploadButtonClick() {
 
         }
 
-        // Messages to communicate to device via USB
-        const requestMetaDataMessage = new Uint8Array([AM_USB_MSG_TYPE_GET_SNAPSHOT]);
-        const requestSnapshotMessage = new Uint8Array([AM_USB_MSG_TYPE_GET_SNAPSHOT_PAGE]);
+    }
 
-        // Keep reading data from device until all snapshots are read
-        let keepReading = true;
+    const snapshots = buildRawSnapshots(metaList, bufferList);
 
-        latestDate = null;
-        earliestDate = null;
-
-        // Create empty queue for snapshot uplaod tasks
-        device2ServerQueue = [];
-        // Queue index
-        taskIndex = 0;
-        // Indicator if all snapshots from device have been pushed into queue
-        isQueueFull = false;
-
-        while (keepReading) {
-
-            try {
-
-                console.log('Request meta data.');
-                // Request to start reading new record from flash memory, start with meta data
-                let result = await device.transferOut(0x01, requestMetaDataMessage);
-
-                console.log('Wait for meta data.');
-                // Wait until meta data is returned
-                result = await device.transferIn(0x01, 128);
-
-                const data = result.data;
-
-                // Check if device has sent data
-                // Device uses 2nd byte of transmit buffer as valid flag
-                if (data.getUint8(1) !== 0x00) {
-
-                    console.log('Extract time stamp.');
-
-                    const meta = new MetaData(data);
-
-                    console.log(meta);
-
-                    /* Following block introduced by Peter. Do we really need
-                    it? The 1st snapshot from the device will always be the
-                    earliest one and the last snapshot the latest one. */
-
-                    if (!latestDate || meta.timestamp > latestDate) {
-
-                        latestDate = meta.timestamp;
-
-                    }
-
-                    if (!earliestDate || meta.timestamp < earliestDate) {
-
-                        earliestDate = meta.timestamp;
-
-                    }
-
-                    console.log('Start reading snapshot.');
-
-                    // Index of next unwritten element in snapshotBuffer
-
-                    console.log('Requesting snapshot');
-
-                    // Send message to device to request next piece of snapshot
-
-                    let result = await device.transferOut(0x01, requestSnapshotMessage);
-
-                    console.log('Waiting for snapshot');
-                    result = await device.transferIn(0x01, SNAPSHOT_BUFFER_SIZE - METADATA_SIZE);
-
-                    device2ServerQueue.push({
-                        uploadID: uploadID,
-                        meta: meta,
-                        data: result.data
-                    });
-
-                    // Check if queue processor is running
-                    if (!isProcessing) {
-
-                        // Start queue processor
-                        processDevice2ServerQueue().then(async function () {
-
-                            // After queue processor is done, check if all snapshots haven been processed
-                            // If yes, complete upload.
-                            if (isQueueFull) {
-
-                                console.log('Complete upload after processDevice2ServerQueue().');
-                                await postSnapshotUploadDevice(uploadID);
-
-                            } else {
-
-                                // If not, wait for queue processor to complete
-                                console.log('Wait for onDeviceUploadButtonClick() to complete upload.');
-
-                            }
-
-                        }).catch(console.error);
-
-                    }
-
-                } else {
-
-                    // All snapshot data has been read from flash
-
-                    keepReading = false;
-
-                }
-
-            } catch (err) {
-
-                // Stop reading if USB communication failed
-
-                console.error(err);
-
-                displayError('We could not read all data from your SnapperGPS receiver. You might want to unplug and reconnect it and try again.');
-
-                cancelUpload(uploadID);
-
-                setDeviceUploading(false);
-
-                return;
-
-            }
-
-        }
-
-        // Check if queue processor is running
-        if (!isProcessing) {
-
-            // If the queue processor is not running anymore, then all snapshots
-            // are uploaded and the upload can be finalized.
-            console.log('Complete upload from onDeviceUploadButtonClick().');
-            await postSnapshotUploadDevice(uploadID);
-
-        } else {
-
-            // We will let the queue processor trigger postSnapshotUploadDevice().
-            isQueueFull = true;
-            console.log('Wait for processDevice2ServerQueue() to complete upload.');
-
-        }
-
-    });
+    await finishAndUpload(snapshots, earliestDate, latestDate, setDeviceUploading);
 
 }
 
 /**
- * Function to execute after all individual snapshots have been uplaoded from
- * device to server. Adds reference points to database and changes the state of
- * the upload from 'uploading' to 'waiting'.
-  * @param {string}      uploadID Unique ID returned by startUpload().
+ * Finish an upload after all snapshots have been collected (from the
+ * receiver, a JSON file, .bin files, or a locally saved transfer):
+ * build the form state, run the reserve -> Storage -> Firestore flow, and
+ * redirect to the success page (or show a quota/error message).
+ * @param {Array} snapshots Snapshots in raw upload format.
+ * @param {Date|null} earliestDate Timestamp of the 1st snapshot.
+ * @param {Date|null} latestDate Timestamp of the last snapshot.
+ * @param {Function} [setUploading] UI helper to re-enable the page.
+ * @returns {Promise<void>}
  */
-async function postSnapshotUploadDevice(uploadID) {
-
-    // Display progress on UI
-    snapshotCountLabelUpload.innerHTML = snapshotCountLabelUpload.innerHTML + ' Completing upload.';
+async function finishAndUpload(snapshots, earliestDate, latestDate, setUploading) {
 
     // Create an array of reference points in this way so it's easy to expand to more than just two later
 
     const referencePoints = [];
 
+    let dt0;
+    let dt1;
+
     if (timeInputs[0].value === '' || dateInputs[0].value === '') {
         console.log('Use timestamp of first snapshot for start point.');
-        var dt0 = earliestDate;
+        dt0 = earliestDate;
     } else {
-        var dt0 = new Date(dateInputs[0].value + ' ' + timeInputs[0].value);
+        dt0 = dateFromInputs(dateInputs[0].value, timeInputs[0].value);
     }
     if (timeInputs[1].value === '' || dateInputs[1].value === '') {
         console.log('Use timestamp of last snapshot for end point.');
-        var dt1 = latestDate;
+        dt1 = latestDate;
     } else {
-        var dt1 = new Date(dateInputs[1].value + ' ' + timeInputs[1].value);
+        dt1 = dateFromInputs(dateInputs[1].value, timeInputs[1].value);
     }
     referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt0));
     referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt1));
 
-    // Add however many reference points are given by the user
+    const maxVelocity = getMaxVelocity();
 
-    for (let i = 0; i < referencePoints.length; i++) {
+    const uploadFormState = {
+        deviceId: deviceID,
+        firmware: (typeof firmwareDescription === 'string' && firmwareDescription !== null) ? firmwareDescription : null,
+        firmwareVersion: (Array.isArray(firmwareVersion) && firmwareVersion[0] !== null && firmwareVersion[0] !== undefined)
+            ? firmwareVersion.join('.') : null,
+        nickname: nicknameInput.value || null,
+        email: emailInput.value || null,
+        chatId: null,
+        pushSubscription: subscriptionJson,
+        startDate: dt0 ? dt0.toISOString() : null,
+        endDate: dt1 ? dt1.toISOString() : null,
+        maxVelocity: isNaN(maxVelocity) ? null : maxVelocity,
+        frequencyOffset: null,
+        earliestSnapshotTime: earliestDate ? earliestDate.toISOString() : null,
+        latestSnapshotTime: latestDate ? latestDate.toISOString() : null
+    };
 
-        const point = referencePoints[i];
+    // Display progress on UI
+    snapshotCountLabelUpload.innerHTML = snapshotCountLabelUpload.innerHTML + ' Preparing upload.';
 
-        const referencePointSuccess = await addReferencePoint(uploadID, point.lat, point.lng, point.dt);
+    const uploadProgress = (progress) => {
 
-        if (!referencePointSuccess) {
+        if (progress.stage === 'compressing') {
 
-            displayError('Failed to set reference point.');
+            snapshotCountLabelUpload.innerHTML = 'Compressing data.';
 
-            cancelUpload(uploadID);
+        } else if (progress.stage === 'reserving') {
 
-            setDeviceUploading(false);
+            snapshotCountLabelUpload.innerHTML = 'Checking free upload quota.';
 
-            return;
+        } else if (progress.stage === 'uploading') {
 
-        }
-
-    }
-
-    // Take the day of the latest snapshot and then the data can be processed when that navdata is available (midday the next day)
-
-    // If the priority upload checkbox is checked, snapshots will be processed asap, regardless of available nav data
-
-    let earliestProcessingDateString;
-    switch (getSelectedRadioValue('priority-radio')) {
-
-        case 0:
-            // immidiate
-            earliestProcessingDateString = '1970-01-01 01:01:01';
-            break;
-
-        case 1:
-            // rapid
-            earliestProcessingDateString = dateToDatabaseString(latestDate, 0);
-            break;
-
-        case 2:
-            // delayed
-            latestDate.setDate(latestDate.getDate() + 1);
-            earliestProcessingDateString = dateToDatabaseString(latestDate, 12);
-            break;
-
-    }
-
-    finishUpload(uploadID, earliestProcessingDateString, (response) => {
-
-        if (!response) {
-
-            displayError('Snapshots uploaded, however upload status could not be changed from "uploading".');
-
-            setDeviceUploading(false);
-
-            return;
+            const percent = Math.round(progress.value * 100);
+            snapshotCountLabelUpload.innerHTML = `Uploading (${percent}%).`;
 
         }
 
-        // Store response in local storage with maximum length 20; newest element always first
-        storeUploadID(response);
+    };
 
-        console.log('Upload success');
-        window.location.href = '/success?uploadid=' + response +
-                               '&email=' + emailInput.value +
-                               '&push=' + notificationCheckbox.checked;
+    let result;
 
-    });
+    try {
+
+        result = await uploadSnapperData(uploadFormState, snapshots, referencePoints, uploadProgress);
+
+    } catch (err) {
+
+        displayError(err.message);
+
+        if (setUploading) {
+
+            setUploading(false);
+
+        }
+
+        return;
+
+    }
+
+    if (!result.accepted) {
+
+        // Quota is full: keep any local pending transfer and show the
+        // banner described in the design.
+        const nextAvailable = formatNextAvailableAt(result.nextAvailableAt);
+
+        const banner = 'The free SnapperGPS upload quota is currently full. ' +
+                       (nextAvailable ? 'Please try again on ' + nextAvailable + '.' : 'Please try again later.');
+
+        displayError(banner);
+
+        if (setUploading) {
+
+            setUploading(false);
+
+        }
+
+        return;
+
+    }
+
+    // Store response in local storage with maximum length 20; newest element always first
+    storeUploadID(result.uploadId);
+
+    console.log('Upload success');
+    window.location.href = 'success.html?uploadid=' + result.uploadId +
+                           '&email=' + encodeURIComponent(emailInput.value) +
+                           '&push=' + notificationCheckbox.checked;
 
 }
 
 /**
- * Asynchronously read meta data and snapshot from JSON and upload them.
- * Do not invoke this function too often in parallel, e.g., for all
- * (potentially 11,000) snapshots. Instead, cap the maximum number of
- * instances running at the same time with processFile2ServerQueue().
- * @param {string}      uploadID Unique ID returned by startUpload().
- * @param {object}      snapshot Element of snapshot list.
+ * Asynchronously read meta data and snapshot from JSON and collect them.
+ * @param {object} snapshot Element of snapshot list.
+ * @returns {Promise<Object>} Snapshot in raw upload format.
  */
-async function getSnapshotJSON(uploadID, snapshot) {
+async function snapshotFromJSON(snapshot) {
 
-    return new Promise((resolve) => {
+    // Get timestamp from JSON
+    const dt = new Date(snapshot.timestamp);
+    // Get temperature from JSON
+    const temperature = snapshot.temperature;
+    // Get battery voltage from JSON
+    const battery = snapshot.batteryVoltage;
+    // Base64 data is passed through unchanged
+    const dataBase64 = snapshot.data;
 
-        // Get timestamp from JSON
-        const dt = new Date(snapshot.timestamp);
-        // Get temperature from JSON
-        const temperature = snapshot.temperature;
-        // Get battery voltage from JSON
-        const battery = snapshot.batteryVoltage;
-        // Convert base64 data to blob
-        const byteCharacters = atob(snapshot.data);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let j = 0; j < byteCharacters.length; ++j) {
-
-            byteNumbers[j] = byteCharacters.charCodeAt(j);
-
-        }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: 'application/octet-stream' });
-        // Upload everything for this snapshot
-        resolve(uploadSnapshot(uploadID, blob, dt, battery, 1, 1, temperature));
-
-    });
-
-}
-
-/**
- * Upload max 4 snapshots from JSON file in parallel.
- * @param {string}      uploadID Unique ID returned by startUpload().
- * @param {Array}       snapshots Array of snapshots from JSON file.
- */
-function processFile2ServerQueue(uploadID, snapshots, maxNumOfWorkers = 4) {
-
-    // Number of busy workers
-    var numOfWorkers = 0;
-
-    // Index of snapshot in queue to process next
-    var taskIndex = 0;
-
-    return new Promise(resolve => {
-
-        const handleResult = index => result => {
-
-            // Could store success/fail boolean in array here: array[index] = result
-            if (!result) {
-
-                displayError('We could not upload at least one of your snapshots.');
-
-            }
-            // Count snapshots on UI
-            snapshotCountLabelUpload.innerHTML = `${index + 1} snapshots uploaded.`;
-            // Worker is done with uploading a snapshot and now idle and ready to tackle a new one
-            numOfWorkers--;
-            // Find a new snapshot to upload for the worker
-            getNextTask();
-
-        };
-
-        const getNextTask = () => {
-
-            // Check if a worker is idle and snapshots are left in the queue
-            if (numOfWorkers < maxNumOfWorkers && taskIndex < snapshots.length) {
-
-                // Upload next snapshot in queue
-                getSnapshotJSON(uploadID, snapshots[taskIndex]).then(handleResult(taskIndex)).catch(handleResult(taskIndex));
-                // Move on to next snapshot in queue
-                taskIndex++;
-                // Indicate that one more worker is busy
-                numOfWorkers++;
-                // Check if we have the resources to process the next snapshot in the queue
-                getNextTask();
-
-            // Check if all workers are idle and the queue is empty
-            } else if (numOfWorkers === 0 && taskIndex === snapshots.length) {
-
-                // We are done and could return something, if desired.
-                resolve(); // Could return array of success/fail booleans here: resolve(array)
-
-            }
-
-        };
-
-        // Start with processing first snapshot in queue
-        getNextTask();
-
-    });
+    return {
+        i: 0, // index is set later
+        datetime: dt.toISOString(),
+        battery: battery,
+        hxfoCount: 1,
+        lxfoCount: 1,
+        temperature: temperature,
+        dataBase64: dataBase64
+    };
 
 }
 
 /**
  * React to upload button being clicked by attempting to upload provided data
  */
-function onSelectedUploadButtonClick() {
+async function onSelectedUploadButtonClick() {
 
     snapshotCountLabelUpload.innerHTML = '0 snapshots uploaded.';
-
-    // uploadCount = 0;
-    // uploadCountLabel.innerHTML = `${uploadCount} snapshots uploaded.`;
 
     const email = emailInput.value; // User e-mail
 
@@ -1105,7 +962,7 @@ function onSelectedUploadButtonClick() {
 
         // Read JSON file
         const reader = new FileReader();
-        reader.onload = function (e) {
+        reader.onload = async function (e) {
 
             const dataObj = JSON.parse(e.target.result);
             // Check for valid JSON structure
@@ -1120,176 +977,71 @@ function onSelectedUploadButtonClick() {
 
             }
             // Get device ID from JSON
-            const deviceID = dataObj.deviceID;
-            // Create row for upload in database
-            startUpload(deviceID, email, subscriptionJson, maxVelocity, nickname, async (err, uploadID) => {
+            deviceID = dataObj.deviceID;
+            firmwareDescription = dataObj.firmwareDescription || null;
+            firmwareVersion = (typeof dataObj.firmwareVersion === 'string')
+                ? dataObj.firmwareVersion.split('.') : [null, null, null];
 
-                if (err) {
+            // Get snapshots from JSON
+            const rawSnapshots = dataObj.snapshots;
+            // Get number of snapshots
+            const snapshotCount = rawSnapshots.length;
+            // Remember earliest and latest snapshot timestamps
+            let earliestDate, latestDate;
+            // Collect snapshots in raw upload format
+            const snapshots = [];
+
+            for (let i = 0; i < snapshotCount; ++i) {
+
+                // Check for valid JSON structure
+                if (!rawSnapshots[i].hasOwnProperty('timestamp') ||
+                    !rawSnapshots[i].hasOwnProperty('temperature') ||
+                    !rawSnapshots[i].hasOwnProperty('batteryVoltage') ||
+                    !rawSnapshots[i].hasOwnProperty('data')) {
 
                     console.error('Upload failed');
                     errorCard.style.display = '';
-                    errorText.innerHTML = err;
+                    errorText.innerHTML = 'A snapshot in your JSON file has the wrong format.';
                     setSelectedUploading(false);
                     window.scrollTo(0, 0);
                     return;
 
                 }
-                console.log('Upload started.');
-                // Get snapshots from JSON
-                const snapshots = dataObj.snapshots;
-                // Get number of snapshots
-                const snapshotCount = snapshots.length;
-                // Remember earliest and latest snapshot timestamps
-                let earliestDate, latestDate;
-                // Loop over all snapshots
-                for (let i = 0; i < snapshotCount; ++i) {
 
-                    // Check for valid JSON structure
-                    if (!snapshots[i].hasOwnProperty('timestamp') ||
-                        !snapshots[i].hasOwnProperty('temperature') ||
-                        !snapshots[i].hasOwnProperty('batteryVoltage') ||
-                        !snapshots[i].hasOwnProperty('data')) {
+                // Get timestamp from JSON
+                const dt = new Date(rawSnapshots[i].timestamp);
 
-                        console.error('Upload failed');
-                        errorCard.style.display = '';
-                        errorText.innerHTML = 'A snapshot in your JSON file has the wrong format.';
-                        setSelectedUploading(false);
-                        window.scrollTo(0, 0);
-                        return;
+                if (!(dt instanceof Date) || isNaN(dt)) {
 
-                    }
-
-                    // Get timestamp from JSON
-                    const dt = new Date(snapshots[i].timestamp);
-
-                    if (!(dt instanceof Date) || isNaN(dt)) {
-
-                        console.error('Upload failed');
-                        errorCard.style.display = '';
-                        errorText.innerHTML = 'A timestamp in your JSON file has the wrong format.';
-                        setSelectedUploading(false);
-                        window.scrollTo(0, 0);
-                        return;
-
-                    }
-
-                    if (!latestDate || dt > latestDate) {
-
-                        latestDate = dt;
-
-                    }
-                    if (!earliestDate || dt < earliestDate) {
-
-                        earliestDate = dt;
-
-                    }
+                    console.error('Upload failed');
+                    errorCard.style.display = '';
+                    errorText.innerHTML = 'A timestamp in your JSON file has the wrong format.';
+                    setSelectedUploading(false);
+                    window.scrollTo(0, 0);
+                    return;
 
                 }
 
-                await processFile2ServerQueue(uploadID, snapshots);
+                if (!latestDate || dt > latestDate) {
 
-                // Display progress on UI
-                snapshotCountLabelUpload.innerHTML = snapshotCountLabelUpload.innerHTML + ' Completing upload.';
+                    latestDate = dt;
 
-                // Create an array of reference points in this way so it's easy to expand to more than just two later
-
-                const referencePoints = [];
-
-                if (timeInputs[0].value === '' || dateInputs[0].value === '') {
-                    console.log('Use timestamp of first snapshot for start point.');
-                    var dt0 = earliestDate;
-                } else {
-                    var dt0 = new Date(dateInputs[0].value + ' ' + timeInputs[0].value);
-                    // Fix WebKit problem (WebKit does not recognise YYYY-MM-DD, but YYYY/MM/DD)
-                    if (isNaN(dt0)) {
-                        console.log('Problem with input date, trying to fix it...');
-                        dt0 = new Date(dateInputs[0].value.replace(/-/g, '/') + ' ' + timeInputs[0].value);
-                    }
                 }
-                if (timeInputs[1].value === '' || dateInputs[1].value === '') {
-                    console.log('Use timestamp of last snapshot for end point.');
-                    var dt1 = latestDate;
-                } else {
-                    var dt1 = new Date(dateInputs[1].value + ' ' + timeInputs[1].value);
-                    // Fix WebKit problem (WebKit does not recognise YYYY-MM-DD, but YYYY/MM/DD)
-                    if (isNaN(dt1)) {
-                        console.log('Problem with input date, trying to fix it...');
-                        dt1 = new Date(dateInputs[1].value.replace(/-/g, '/') + ' ' + timeInputs[1].value);
-                    }
-                }
-                referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt0));
-                referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt1));
+                if (!earliestDate || dt < earliestDate) {
 
-                // Add however many reference points are given by the user
-
-                for (let i = 0; i < referencePoints.length; i++) {
-
-                    const point = referencePoints[i];
-
-                    const referencePointSuccess = await addReferencePoint(uploadID, point.lat, point.lng, point.dt);
-
-                    if (!referencePointSuccess) {
-
-                        displayError('Failed to set reference point.');
-
-                        cancelUpload(uploadID);
-
-                        setDeviceUploading(false);
-
-                        return;
-
-                    }
+                    earliestDate = dt;
 
                 }
 
-                // Take the day of the latest snapshot and then the data can be processed when that navdata is available (the next morning)
+                const snapshot = await snapshotFromJSON(rawSnapshots[i]);
+                snapshot.i = i;
+                snapshots.push(snapshot);
 
-                // If the priority upload checkbox is checked, snapshots will be processed asap, regardless of available nav data
+                snapshotCountLabelUpload.innerHTML = `${i + 1} snapshots read.`;
 
-                let earliestProcessingDateString;
-                switch (getSelectedRadioValue('priority-radio')) {
+            }
 
-                    case 0:
-                        // immidiate
-                        earliestProcessingDateString = '1970-01-01 01:01:01';
-                        break;
-
-                    case 1:
-                        // rapid
-                        earliestProcessingDateString = dateToDatabaseString(latestDate, 0);
-                        break;
-
-                    case 2:
-                        // delayed
-                        latestDate.setDate(latestDate.getDate() + 1);
-                        earliestProcessingDateString = dateToDatabaseString(latestDate, 12);
-                        break;
-
-                }
-
-                finishUpload(uploadID, earliestProcessingDateString, (response) => {
-
-                    if (!response) {
-
-                        displayError('Snapshots uploaded, however upload status could not be changed from "uploading".');
-
-                        setSelectedUploading(false);
-
-                        return;
-
-                    }
-
-                    // Store response in local storage with maximum length 20; newest element always first
-                    storeUploadID(response);
-
-                    console.log('Upload success');
-                    window.location.href = '/success?uploadid=' + response +
-                        '&email=' + emailInput.value +
-                        '&push=' + notificationCheckbox.checked;
-
-                });
-
-            });
+            await finishAndUpload(snapshots, earliestDate, latestDate, setSelectedUploading);
 
         };
         reader.readAsText(selectedFiles[0]);
@@ -1299,13 +1051,97 @@ function onSelectedUploadButtonClick() {
 
     // .bin files
 
-    const deviceID = 'AAAABBBBCCCCDDDD';
+    deviceID = 'AAAABBBBCCCCDDDD';
 
-    startUpload(deviceID, email, subscriptionJson, maxVelocity, nickname, async (err, uploadID) => {
+    const snapshotCount = selectedFiles.length;
+    let i = 0;
 
-        if (err) {
+    let latestDate, earliestDate;
 
-            displayError(err);
+    let uploadSuccess = true;
+
+    // Collect snapshots in raw upload format
+    const snapshots = [];
+
+    // Using a while loop rather than a for loop so this code can more easily be converted into grabbing an unknown number of snapshots from the device
+    while (i < snapshotCount) {
+
+        const file = selectedFiles[i];
+        const fileName = file.name;
+
+        try {
+
+            try {
+
+                const year = parseInt(fileName.slice(0, 4));
+                const month = parseInt(fileName.slice(4, 6)) - 1;
+                const day = parseInt(fileName.slice(6, 8));
+                const hours = parseInt(fileName.slice(9, 11));
+                const minutes = parseInt(fileName.slice(11, 13));
+                const seconds = parseInt(fileName.slice(13, 15));
+                const milliseconds = (fileName[13] === '_') ? parseInt(fileName.slice(16, 19)) : 0;
+
+                var dt = new Date(Date.UTC(year, month, day, hours, minutes, seconds, milliseconds));
+
+            } catch {
+
+                throw new Error('The name of at least one of your selected binary snapshot files is invalid. ' +
+                                'It must follow the scheme YYYYMMDD_hhmmss.mmm.bin.');
+
+            }
+
+            if (!(dt instanceof Date) || isNaN(dt)) {
+
+                throw new Error('The name of at least one of your selected binary snapshot files is invalid. ' +
+                                'It must follow the scheme YYYYMMDD_hhmmss.mmm.bin.');
+
+            }
+
+            if (!latestDate || dt > latestDate) {
+
+                latestDate = dt;
+
+            }
+
+            if (!earliestDate || dt < earliestDate) {
+
+                earliestDate = dt;
+
+            }
+
+            try {
+
+                console.log('Uploading file ' + i);
+
+                const fileBuffer = new Uint8Array(await file.arrayBuffer());
+
+                snapshots.push({
+                    i: i,
+                    datetime: dt.toISOString(),
+                    battery: 1,
+                    hxfoCount: 1,
+                    lxfoCount: 1,
+                    temperature: 1,
+                    dataBase64: snapshotBufferToBase64(fileBuffer)
+                });
+
+            } catch {
+
+                throw new Error('We could not read at least one of your snapshot files. ' +
+                                'Please try again.');
+
+            }
+
+            if (!uploadSuccess) {
+
+                throw new Error('We could not read at least one of your snapshot files. ' +
+                                'Please try again.');
+
+            }
+
+        } catch (err) {
+
+            displayError(err.message);
 
             setSelectedUploading(false);
 
@@ -1313,197 +1149,11 @@ function onSelectedUploadButtonClick() {
 
         }
 
-        const snapshotCount = selectedFiles.length;
-        let i = 0;
+        snapshotCountLabelUpload.innerHTML = `${++i} snapshots read.`;
 
-        let latestDate, earliestDate;
+    }
 
-        let uploadSuccess = true;
-
-        // Using a while loop rather than a for loop so this code can more easily be converted into grabbing an unknown number of snapshots from the device
-        while (i < snapshotCount) {
-
-            const file = selectedFiles[i];
-            const fileName = file.name;
-
-            try {
-
-                try {
-
-                    const year = parseInt(fileName.slice(0, 4));
-                    const month = parseInt(fileName.slice(4, 6)) - 1;
-                    const day = parseInt(fileName.slice(6, 8));
-                    const hours = parseInt(fileName.slice(9, 11));
-                    const minutes = parseInt(fileName.slice(11, 13));
-                    const seconds = parseInt(fileName.slice(13, 15));
-                    const milliseconds = (fileName[13] === '_') ? parseInt(fileName.slice(16, 19)) : 0;
-
-                    var dt = new Date(Date.UTC(year, month, day, hours, minutes, seconds, milliseconds));
-
-                } catch {
-
-                    throw new Error('The name of at least one of your selected binary snapshot files is invalid. ' +
-                                    'It must follow the scheme YYYYMMDD_hhmmss.mmm.bin.');
-
-                }
-
-                if (!(dt instanceof Date) || isNaN(dt)) {
-
-                    throw new Error('The name of at least one of your selected binary snapshot files is invalid. ' +
-                                    'It must follow the scheme YYYYMMDD_hhmmss.mmm.bin.');
-
-                }
-
-                if (!latestDate || dt > latestDate) {
-
-                    latestDate = dt;
-
-                }
-
-                if (!earliestDate || dt < earliestDate) {
-
-                    earliestDate = dt;
-
-                }
-
-                try {
-
-                    console.log('Uploading file ' + i);
-
-                    uploadSuccess = await uploadSnapshot(uploadID, file, dt, 1, 1, 1, 1);
-
-                } catch {
-
-                    throw new Error('We could not upload at least one of your snapshots. ' +
-                                    'Please try again.');
-
-                }
-
-                if (!uploadSuccess) {
-
-                    throw new Error('We could not upload at least one of your snapshots. ' +
-                                    'Please try again.');
-
-                }
-
-            } catch (err) {
-
-                displayError(err.message);
-
-                cancelUpload(uploadID);
-
-                setSelectedUploading(false);
-
-                return;
-
-            }
-
-            snapshotCountLabelUpload.innerHTML = `${++i} snapshots uploaded.`;
-
-        }
-
-        // Display progress on UI
-        snapshotCountLabelUpload.innerHTML = snapshotCountLabelUpload.innerHTML + ' Completing upload.';
-
-        // Create an array of reference points in this way so it's easy to expand to more than just two later
-
-        const referencePoints = [];
-
-        if (timeInputs[0].value === '' || dateInputs[0].value === '') {
-            console.log('Use timestamp of first snapshot for start point.');
-            var dt0 = earliestDate;
-        } else {
-            var dt0 = new Date(dateInputs[0].value + ' ' + timeInputs[0].value);
-            // Fix WebKit problem (WebKit does not recognise YYYY-MM-DD, but YYYY/MM/DD)
-            if (isNaN(dt0)) {
-                console.log('Problem with input date, trying to fix it...');
-                dt0 = new Date(dateInputs[0].value.replace(/-/g, '/') + ' ' + timeInputs[0].value);
-            }
-        }
-        if (timeInputs[1].value === '' || dateInputs[1].value === '') {
-            console.log('Use timestamp of last snapshot for end point.');
-            var dt1 = latestDate;
-        } else {
-            var dt1 = new Date(dateInputs[1].value + ' ' + timeInputs[1].value);
-            // Fix WebKit problem (WebKit does not recognise YYYY-MM-DD, but YYYY/MM/DD)
-            if (isNaN(dt1)) {
-                console.log('Problem with input date, trying to fix it...');
-                dt1 = new Date(dateInputs[1].value.replace(/-/g, '/') + ' ' + timeInputs[1].value);
-            }
-        }
-        referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt0));
-        referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt1));
-
-        // Add however many reference points are given by the user
-
-        for (let i = 0; i < referencePoints.length; i++) {
-
-            const point = referencePoints[i];
-
-            const referencePointSuccess = await addReferencePoint(uploadID, point.lat, point.lng, point.dt);
-
-            if (!referencePointSuccess) {
-
-                displayError('Failed to set reference point.');
-
-                cancelUpload(uploadID);
-
-                setDeviceUploading(false);
-
-                return;
-
-            }
-
-        }
-
-        // Take the day of the latest snapshot and then the data can be processed when that navdata is available (the next morning)
-
-        // If the priority upload checkbox is checked, snapshots will be processed asap, regardless of available nav data
-
-        let earliestProcessingDateString;
-        switch (getSelectedRadioValue('priority-radio')) {
-
-            case 0:
-                // immidiate
-                earliestProcessingDateString = '1970-01-01 01:01:01';
-                break;
-
-            case 1:
-                // rapid
-                earliestProcessingDateString = dateToDatabaseString(latestDate, 0);
-                break;
-
-            case 2:
-                // delayed
-                latestDate.setDate(latestDate.getDate() + 1);
-                earliestProcessingDateString = dateToDatabaseString(latestDate, 12);
-                break;
-
-        }
-
-        finishUpload(uploadID, earliestProcessingDateString, (response) => {
-
-            if (!response) {
-
-                displayError('Snapshots uploaded, however upload status could not be changed from "uploading".');
-
-                setSelectedUploading(false);
-
-                return;
-
-            }
-
-            // Store response in local storage with maximum length 20; newest element always first
-            storeUploadID(response);
-
-            console.log('Upload success');
-            window.location.href = '/success?uploadid=' + response +
-                                   '&email=' + emailInput.value +
-                                   '&push=' + notificationCheckbox.checked;
-
-        });
-
-    });
+    await finishAndUpload(snapshots, earliestDate, latestDate, setSelectedUploading);
 
 }
 
@@ -1519,25 +1169,6 @@ async function storeUploadID(response) {
 
     localStorage.setItem('uploadData', JSON.stringify(uploadData));
     
-}
-
-
-function dateToDatabaseString(latestDate, hours) {
-
-    const year = latestDate.getFullYear();
-    const month = latestDate.getMonth() + 1;
-    const day = latestDate.getDate();
-
-    let latestDateString = year.toString();
-    latestDateString += '-';
-    latestDateString += month.toString();
-    latestDateString += '-';
-    latestDateString += day.toString();
-    latestDateString += ' ';
-    latestDateString += (('00' + hours).slice(-3) + ':00:00.0');
-
-    return latestDateString;
-
 }
 
 /**
@@ -1710,20 +1341,10 @@ function checkInputs() {
 
     if (dateInputs[0] !== '' && dateInputs[1] !== '' && timeInputs[0] !== '' && timeInputs[1] !== '') {
 
-        let startDt = new Date(dateInputs[0].value + ' ' + timeInputs[0].value);
-        // Fix WebKit problem (WebKit does not recognise YYYY-MM-DD, but YYYY/MM/DD)
-        if (isNaN(startDt)) {
-            console.log('Problem with input date, trying to fix it...');
-            startDt = new Date(dateInputs[0].value.replace(/-/g, '/') + ' ' + timeInputs[0].value);
-        }
-        let endDt = new Date(dateInputs[1].value + ' ' + timeInputs[1].value);
-        // Fix WebKit problem (WebKit does not recognise YYYY-MM-DD, but YYYY/MM/DD)
-        if (isNaN(endDt)) {
-            console.log('Problem with input date, trying to fix it...');
-            endDt = new Date(dateInputs[1].value.replace(/-/g, '/') + ' ' + timeInputs[1].value);
-        }
+        let startDt = dateFromInputs(dateInputs[0].value, timeInputs[0].value);
+        let endDt = dateFromInputs(dateInputs[1].value, timeInputs[1].value);
 
-        if (startDt > endDt) {
+        if (startDt !== null && endDt !== null && startDt > endDt) {
 
             displayError('Time/date of start point must come before end point.');
 
@@ -1757,29 +1378,6 @@ function checkInputs() {
     errorCard.style.display = 'none';
 
     return true;
-
-}
-
-/**
-   * Meta data object.
-   * @param  {ArrayBuffer}  data Byte array returned from receiver after requesting meta data.
-   * @return {Object}       meta Meta data object
-   *    @return {Date}      meta.timestamp Timestamp of snapshot
-   *    @return {Number}    meta.temperature Temperature measurement in degrees Celsius
-   *    @return {Number}    meta.battery Battery voltage measurement in volts
-   */
-function MetaData(data) {
-
-    // Get timestamp of snapshot
-    const seconds = data.getUint8(2) + 256 * (data.getUint8(3) + 256 * (data.getUint8(4) + 256 * data.getUint8(5)));
-    const milliseconds = Math.round((data.getUint8(6) + 256 * data.getUint8(7)) / 1024 * 1000);
-    this.timestamp = new Date(seconds * 1000 + milliseconds);
-
-    // Convert tenths of degrees Celsius to degrees Celsius
-    this.temperature = (data.getUint8(10) + 256 * (data.getUint8(11) + 256 * (data.getUint8(12) + 256 * data.getUint8(13))) - 1024) / 10.0;
-
-    // Convert hundreds of volts to volts
-    this.battery = (data.getUint8(14) + 256 * (data.getUint8(15) + 256 * (data.getUint8(16) + 256 * data.getUint8(17)))) / 100.0;
 
 }
 
@@ -2011,7 +1609,7 @@ transferButton.onclick = async () => {
                     timestamp: meta.timestamp.toISOString(),
                     temperature: meta.temperature,
                     batteryVoltage: meta.battery,
-                    data: btoa(String.fromCharCode.apply(null, snapshotBuffer))
+                    data: snapshotBufferToBase64(snapshotBuffer)
                 });
 
                 snapshotCountLabelTransfer.innerHTML = `${++snapshotCount} snapshots transferred.`;
@@ -2059,6 +1657,32 @@ transferButton.onclick = async () => {
     createDownloadLink(jsonContent, jsonData.deviceID + timeString + '.json');
 
     snapshotCountLabelTransfer.innerHTML = snapshotCountLabelMemory;
+
+    // Also store the recording locally (IndexedDB) as a pending upload so
+    // it can be uploaded later, even after the browser was closed.
+
+    if (jsonData.snapshots.length > 0) {
+
+        try {
+
+            await savePendingUpload({
+                deviceId: jsonData.deviceID,
+                firmwareDescription: jsonData.firmwareDescription,
+                firmwareVersion: jsonData.firmwareVersion,
+                snapshots: jsonData.snapshots
+            });
+
+            snapshotCountLabelTransfer.innerHTML = snapshotCountLabelMemory + ' Saved transfer locally.';
+
+            renderPendingUploads();
+
+        } catch (err) {
+
+            console.warn('Could not save transfer locally: ' + err.message);
+
+        }
+
+    }
 
     if (USE_ZIP) {
 
@@ -2123,6 +1747,228 @@ transferButton.onclick = async () => {
 }
 
 /**
+ * Render the list of locally saved (pending) transfers and wire their
+ * Upload/Delete buttons. Pending transfers can be uploaded whenever the
+ * device is back online; if the quota is full the record is kept and the
+ * user is told when to try again.
+ */
+async function renderPendingUploads() {
+
+    if (!pendingUploadsContainer) {
+
+        return;
+
+    }
+
+    let records = [];
+
+    try {
+
+        records = await listPendingUploads();
+
+    } catch (err) {
+
+        console.warn('Could not list pending uploads: ' + err.message);
+        pendingUploadsContainer.style.display = 'none';
+
+        return;
+
+    }
+
+    pendingUploadsContainer.innerHTML = '';
+
+    if (records.length === 0) {
+
+        pendingUploadsContainer.style.display = 'none';
+
+        return;
+
+    }
+
+    pendingUploadsContainer.style.display = '';
+
+    records.forEach((record) => {
+
+        const row = document.createElement('div');
+        row.className = 'row row-ident';
+
+        const col = document.createElement('div');
+        col.className = 'col';
+        col.style.marginBottom = '10px';
+
+        const info = document.createElement('span');
+        info.textContent = `${record.deviceId} (${record.snapshots.length} snapshots, saved ${new Date(record.createdAt).toLocaleString()}). `;
+
+        const uploadButton = document.createElement('button');
+        uploadButton.className = 'btn btn-primary btn-sm';
+        uploadButton.textContent = 'Upload';
+        uploadButton.style.marginLeft = '10px';
+
+        const deleteButton = document.createElement('button');
+        deleteButton.className = 'btn btn-primary btn-sm';
+        deleteButton.textContent = 'Delete';
+        deleteButton.style.marginLeft = '10px';
+
+        uploadButton.addEventListener('click', async () => {
+
+            if (!checkInputs()) {
+
+                window.scrollTo(0, 0);
+                return;
+
+            }
+
+            uploadButton.disabled = true;
+            deleteButton.disabled = true;
+
+            snapshotCountLabelUpload.innerHTML = '0 snapshots uploaded.';
+
+            setSelectedUploading(true);
+
+            // Reference points are taken from the current form, exactly like
+            // for an upload from the receiver.
+            let latestDate = null;
+            let earliestDate = null;
+
+            for (const snapshot of record.snapshots) {
+
+                const dt = new Date(snapshot.timestamp);
+
+                if (!latestDate || dt > latestDate) {
+                    latestDate = dt;
+                }
+                if (!earliestDate || dt < earliestDate) {
+                    earliestDate = dt;
+                }
+
+            }
+
+            const maxVelocity = getMaxVelocity();
+
+            if (isNaN(maxVelocity)) {
+
+                setSelectedUploading(false);
+                return;
+
+            }
+
+            const referencePoints = [];
+
+            let dt0;
+            let dt1;
+
+            if (timeInputs[0].value === '' || dateInputs[0].value === '') {
+                dt0 = earliestDate;
+            } else {
+                dt0 = dateFromInputs(dateInputs[0].value, timeInputs[0].value);
+            }
+            if (timeInputs[1].value === '' || dateInputs[1].value === '') {
+                dt1 = latestDate;
+            } else {
+                dt1 = dateFromInputs(dateInputs[1].value, timeInputs[1].value);
+            }
+            referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt0));
+            referencePoints.push(createReferencePointJSON(latInputs[0], lngInputs[0], dt1));
+
+            const uploadFormState = {
+                deviceId: record.deviceId,
+                nickname: nicknameInput.value || null,
+                email: emailInput.value || null,
+                chatId: null,
+                pushSubscription: subscriptionJson,
+                startDate: dt0 ? dt0.toISOString() : null,
+                endDate: dt1 ? dt1.toISOString() : null,
+                maxVelocity: isNaN(maxVelocity) ? null : maxVelocity,
+                frequencyOffset: null,
+                earliestSnapshotTime: earliestDate ? earliestDate.toISOString() : null,
+                latestSnapshotTime: latestDate ? latestDate.toISOString() : null
+            };
+
+            snapshotCountLabelUpload.innerHTML = 'Preparing upload.';
+
+            const uploadProgress = (progress) => {
+
+                if (progress.stage === 'compressing') {
+
+                    snapshotCountLabelUpload.innerHTML = 'Compressing data.';
+
+                } else if (progress.stage === 'reserving') {
+
+                    snapshotCountLabelUpload.innerHTML = 'Checking free upload quota.';
+
+                } else if (progress.stage === 'uploading') {
+
+                    const percent = Math.round(progress.value * 100);
+                    snapshotCountLabelUpload.innerHTML = `Uploading (${percent}%).`;
+
+                }
+
+            };
+
+            let result;
+
+            try {
+
+                result = await uploadPendingRecord(record, uploadFormState, referencePoints, uploadProgress);
+
+            } catch (err) {
+
+                displayError(err.message);
+
+                setSelectedUploading(false);
+                renderPendingUploads();
+
+                return;
+
+            }
+
+            if (!result.accepted) {
+
+                // Quota full: KEEP the local record and show "try again on ...".
+                const nextAvailable = formatNextAvailableAt(result.nextAvailableAt);
+
+                const banner = 'The free SnapperGPS upload quota is currently full. ' +
+                               (nextAvailable ? 'Please try again on ' + nextAvailable + '.' : 'Please try again later.');
+
+                displayError(banner);
+
+                setSelectedUploading(false);
+                renderPendingUploads();
+
+                return;
+
+            }
+
+            // Success: remove the local record and redirect.
+            await deletePendingUpload(record.id);
+
+            storeUploadID(result.uploadId);
+
+            console.log('Upload success');
+            window.location.href = 'success.html?uploadid=' + result.uploadId +
+                                   '&email=' + encodeURIComponent(emailInput.value) +
+                                   '&push=' + notificationCheckbox.checked;
+
+        });
+
+        deleteButton.addEventListener('click', async () => {
+
+            await deletePendingUpload(record.id);
+            renderPendingUploads();
+
+        });
+
+        col.appendChild(info);
+        col.appendChild(uploadButton);
+        col.appendChild(deleteButton);
+        row.appendChild(col);
+        pendingUploadsContainer.appendChild(row);
+
+    });
+
+}
+
+/**
  * Create an encoded URI to download positions data
  * @param {string} content Text content to be downloaded
  */
@@ -2159,89 +2005,21 @@ fileInput.addEventListener('change', function () {
 
 });
 
+// Push notification handling (see notifications.js)
+
 notificationCheckbox.onchange = async () => {
 
-    // This function is needed because Chrome doesn't accept a base64 encoded string
-    // as value for applicationServerKey in pushManager.subscribe yet
-    // https://bugs.chromium.org/p/chromium/issues/detail?id=802280
-    function urlBase64ToUint8Array(base64String) {
-        var padding = '='.repeat((4 - base64String.length % 4) % 4);
-        var base64 = (base64String + padding)
-            .replace(/\-/g, '+')
-            .replace(/_/g, '/');
+    try {
 
-        var rawData = window.atob(base64);
-        var outputArray = new Uint8Array(rawData.length);
-
-        for (var i = 0; i < rawData.length; ++i) {
-
-            outputArray[i] = rawData.charCodeAt(i);
-
-        }
-        return outputArray;
-
-    }
-
-    navigator.serviceWorker.ready.then(function (registration) {
-
-        // Use the PushManager to get the user's subscription to the push service.
-        return registration.pushManager.getSubscription().then(async function (subscription) {
-
-            // If a subscription was found, return it.
-            if (subscription) {
-
-                console.log('Already subscribed.');
-
-                if (!notificationCheckbox.checked) {
-
-                    // subscription.unsubscribe();
-
-                    subscriptionJson = '{}';
-
-                    console.log('Unsubscribed.');
-
-                    return;
-
-                } else {
-
-                    return subscription;
-
-                }
-
-            }
-
-            if (!notificationCheckbox.checked) {
-
-                return;
-
-            } else {
-
-                // Chrome doesn't accept the base64-encoded (string) vapidPublicKey yet
-                const convertedVapidKey = urlBase64ToUint8Array(vapidPublicKey);
-
-                // Otherwise, subscribe the user (userVisibleOnly allows to specify that we don't plan to
-                // send notifications that don't have a visible effect for the user).
-                return registration.pushManager.subscribe({
-                    userVisibleOnly: true,
-                    applicationServerKey: convertedVapidKey
-                });
-
-            }
-
-        });
-
-    }).then(function (subscription) {
+        subscriptionJson = await getPushSubscriptionJson(notificationCheckbox.checked);
 
         if (notificationCheckbox.checked) {
 
-            // Turn subscription details into JSON to send to server.
-            subscriptionJson = JSON.stringify(subscription);
             console.log('We will send a push notfication with the link when processing is complete.');
-            console.log(subscriptionJson);
 
         }
 
-    }).catch(function (err) {
+    } catch (err) {
 
         console.log(err);
         console.log('Since you did not allow push messages, you will not be notified in the web app when processing is complete.');
@@ -2249,8 +2027,9 @@ notificationCheckbox.onchange = async () => {
                      'Please enter an email address or use our Telegram bot ' +
                      'if you want to receive updates about the processing progress.');
         notificationCheckbox.checked = false;
+        subscriptionJson = '{}';
 
-    });
+    }
 
 };
 
@@ -2344,7 +2123,7 @@ if (!navigator.usb) {
 if ('serviceWorker' in navigator) {
 
     // Wait until service worker is ready.
-    navigator.serviceWorker.ready.then(function (registration) {
+    navigator.serviceWorker.ready.then(async function (registration) {
 
         // Check if browser supports push notifications.
         if (registration.pushManager) {
@@ -2353,22 +2132,24 @@ if ('serviceWorker' in navigator) {
             notificationCheckbox.disabled = false;
             notificationLabel.style.color = '';
 
-            // Use the PushManager to get the user's subscription to the push service.
-            registration.pushManager.getSubscription().then(async function (subscription) {
+            // If a subscription already exists, check the checkbox and reuse it.
+            try {
 
-                // If a subscription was found, check checkbox.
-                if (subscription) {
+                const existing = await getCurrentPushSubscriptionJson();
+
+                if (existing !== '{}') {
 
                     notificationCheckbox.checked = true;
-
-                    // Turn subscription details into JSON to send to server.
-                    subscriptionJson = JSON.stringify(subscription);
+                    subscriptionJson = existing;
                     console.log('We will send a push notfication with the link when processing is complete.');
-                    console.log(subscriptionJson);
 
                 }
 
-            });
+            } catch (err) {
+
+                console.log(err);
+
+            }
 
         }
 
@@ -2379,4 +2160,5 @@ if ('serviceWorker' in navigator) {
 // Prepare the start/end location maps
 initialiseMapUI(0);
 
-updateCache();
+// Show locally saved transfers that can be uploaded later.
+renderPendingUploads();

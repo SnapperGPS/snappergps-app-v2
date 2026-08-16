@@ -1060,4 +1060,3 @@ if (!navigator.usb) {
 }
 
 // Update website cache
-updateCache();

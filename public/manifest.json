@@ -20,7 +20,8 @@
             "purpose": "maskable"
         }
     ],
-    "start_url": "https://snappergps.info/",
+    "start_url": "./index.html",
+    "scope": "./",
     "display": "fullscreen",
     "theme_color": "#5E2590",
     "background_color": "#B390CF",
@@ -29,17 +30,17 @@
     "shortcuts": [
         {
             "name": "Configure",
-            "url": "/configure",
+            "url": "./configure.html",
             "description": "Configure your SnapperGPS receiver for your next deployment"
         },
         {
             "name": "Upload",
-            "url": "/upload",
+            "url": "./upload.html",
             "description": "Upload the data from your SnapperGPS receiver after a completed deployment"
         },
         {
             "name": "Download",
-            "url": "/view",
+            "url": "./view.html",
             "description": "View and download the track of your SnapperGPS receiver once processing is completed"
         }
     ],
@@ -50,4 +51,4 @@
             "type": "image/png"
         }
     ]
-  }
+}

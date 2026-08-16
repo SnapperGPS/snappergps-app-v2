@@ -298,8 +298,8 @@ async function updateFirmware(files, FIRMWARE_LENGTH = 48 * 1024, FLASH_PAGE_LEN
             if (files.length === 0) {
 
                 // Get current firmware binary on server
-                // TODO: fetch from GitHub
-                const response = await fetch(`/firmware/${firmwareDescription}.bin`);
+                // (served as a static file from GitHub Pages)
+                const response = await fetch(`firmware/${firmwareDescription}.bin`);
                 data = await response.blob();
 
             } else {

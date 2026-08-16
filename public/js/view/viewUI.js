@@ -6,11 +6,22 @@
 // Geodesy for smoothing
 import LatLon, { Ned } from 'https://cdn.jsdelivr.net/npm/geodesy@2/latlon-nvector-ellipsoidal.js';
 
-/* global loadUploadData, getPositions, L */
+/* global L, getUploadStatus, getReferencePoints, fetchResultBlob, gunzipBlob, downloadBlob */
 
 const mapboxAccessToken = 'pk.eyJ1Ijoiamdyb3Nza3JldXoiLCJhIjoiY2tseWIxNTRoMHFvODJxbHlyanRobzBmZiJ9.xz2KrKBy5MRCf9XLOOPdzA';
 
-const uploadID = document.getElementById('upload-id').getAttribute('value');
+// The upload ID is taken from the URL (?uploadid=...).
+const uploadURLParams = new URLSearchParams(window.location.search);
+const uploadID = uploadURLParams.get('uploadid');
+
+// Show the upload ID in the page title.
+const uploadIdTitle = document.getElementById('upload-id-title');
+
+if (uploadIdTitle) {
+
+    uploadIdTitle.textContent = uploadID || '';
+
+}
 
 var dateTime = null;
 var referencePoints = [];
@@ -137,36 +148,109 @@ function getTileLayers() {
 }
 
 /**
- * Request information needed to fill in UI and map
- * @param {function} callback Function called on completion
+ * Request information needed to fill in UI and map.
+ * Reads the upload metadata from Firestore (uploads/{uploadId}) and the
+ * reference points from the uploads/{uploadId}/referencePoints subcollection.
+ * @param {function} callback Function called with the upload record (or null)
  */
-function getInformation(callback) {
+async function getInformation(callback) {
 
-    loadUploadData(uploadID, (informationRes) => {
+    const upload = await getUploadStatus(uploadID);
 
-        if (!informationRes) {
+    if (!upload) {
 
-            return;
+        callback(null);
+        return;
 
-        }
+    }
 
-        const responseJSON = JSON.parse(informationRes);
+    dateTime = upload.createdAt;
 
-        dateTime = responseJSON.datetime;
+    referencePoints = (await getReferencePoints(uploadID)).map((point) => ({
+        lat: point.lat,
+        lng: point.lng,
+        dt: point.datetime
+    }));
 
-        referencePoints = responseJSON.referencePoints;
+    snapshotCount = upload.snapshotCount || 0;
 
-        snapshotCount = responseJSON.snapshotCount;
+    deviceID = upload.deviceId;
 
-        deviceID = responseJSON.deviceID;
+    maxVelocity = upload.maxVelocity;
 
-        maxVelocity = responseJSON.maxVelocity;
+    nickname = upload.nickname;
 
-        nickname = responseJSON.nickname;
+    callback(upload);
 
-        callback();
+}
+
+/**
+ * Convert a GeoJSON FeatureCollection of position estimates into the array
+ * format used by the rest of this page.
+ * @param {Object} geojson GeoJSON FeatureCollection.
+ * @returns {Array} Positions array.
+ */
+function geojsonToPositions(geojson) {
+
+    const positions = [];
+
+    (geojson.features || []).forEach((feature) => {
+
+        const geometry = feature.geometry || {};
+        const coordinates = geometry.coordinates || [];
+        const props = feature.properties || {};
+
+        positions.push({
+            estimated_lat: coordinates[1],
+            estimated_lng: coordinates[0],
+            timestamp: Date.parse(props.datetime) / 1000,
+            estimated_horizontal_error: (props.estimated_horizontal_error === undefined || props.estimated_horizontal_error === null)
+                ? null : props.estimated_horizontal_error,
+            temperature: props.temperature,
+            battery: props.battery,
+            id: props.snapshot_index
+        });
 
     });
+
+    // Ensure chronological order (defensive; the processor writes them ordered).
+    positions.sort((a, b) => a.timestamp - b.timestamp);
+
+    return positions;
+
+}
+
+/**
+ * Load the preview track (results/{uploadId}/preview.geojson) for the map.
+ * The preview is a simplified/subsampled version of the full result so that
+ * the browser does not need to download a large object just to show the
+ * track.
+ * @returns {Promise<Array>} Positions array.
+ */
+async function loadPreviewPositions() {
+
+    const blob = await fetchResultBlob(uploadID, 'preview.geojson');
+    const text = await blob.text();
+    const geojson = JSON.parse(text);
+
+    return geojsonToPositions(geojson);
+
+}
+
+/**
+ * Download and parse the FULL result object
+ * (results/{uploadId}/positions.geojson.gz). Used by the KML/JSON download
+ * buttons which should contain all position estimates, not just the preview.
+ * @returns {Promise<Array>} Positions array.
+ */
+async function loadFullPositions() {
+
+    const blob = await fetchResultBlob(uploadID, 'positions.geojson.gz');
+    const plain = await gunzipBlob(blob);
+    const text = await plain.text();
+    const geojson = JSON.parse(text);
+
+    return geojsonToPositions(geojson);
 
 }
 
@@ -307,7 +391,7 @@ function populateMap(positions) {
             processingWarningDisplay.style.display = '';
             processingWarningText.innerHTML = 'SnapperGPS did not find any confident location estimates for your uploaded snapshots. ' +
                 'Check the troubleshooting section on ' +
-                "<a class='text-link' href='/'>the home page</a> " +
+                "<a class='text-link' href='index.html'>the home page</a> " +
                 'and the ' +
                 "<a class='text-link' href='https://github.com/SnapperGPS/snappergps-pcb/discussions'>the discussions on GitHub</a> " +
                 'to improve your results.';
@@ -315,14 +399,15 @@ function populateMap(positions) {
             processingWarningDisplay.style.display = '';
             processingWarningText.innerHTML = 'SnapperGPS did not find confident location estimates for quite a few of your uploaded snapshots. ' +
                 'Check the troubleshooting section on ' +
-                "<a class='text-link' href='/'>the home page</a> " +
+                "<a class='text-link' href='index.html'>the home page</a> " +
                 'and the ' +
                 "<a class='text-link' href='https://github.com/SnapperGPS/snappergps-pcb/discussions'>the discussions on GitHub</a> " +
                 'to improve your results.';
         }
 
-        // Display battery warning
+        // Display battery warning (only if the preview provides battery data)
         if (deviceID != 'AAAABBBBCCCCDDDD' &&
+            positions[0].battery !== undefined && positions[0].battery !== null &&
             ((positions[0].battery < batteryWarningThresholdLiPo && positions[0].battery > noBatteryWarningThresholdLR44) ||
             positions[0].battery < batteryWarningThresholdLR44)) {
 
@@ -404,195 +489,180 @@ function fixPrecision(value, precision) {
 
 }
 
-// Download buttons for the upload records as CSV, GeoJSON, JSON or KML file.
-
 /**
- * Download data as .csv file.
- *
- * Yields .csv file with the following columns:
- *  datetime
- *  latitude
- *  longitude
- *  confidence
- *  temperature
- *  battery
- *  id
+ * Wrap a download action and show a warning if it fails (e.g., the result
+ * objects have expired).
+ * @param {Function} action Async download action.
  */
-downloadCSVButton.addEventListener('click', () => {
+async function downloadWithErrorHandling(action) {
 
-    const rows = [['datetime', 'latitude', 'longitude', 'confidence', 'temperature', 'battery', 'id']];
+    try {
 
-    // Loop over all data and add rows to csv array.
-    for (let i = 0; i < positions.length; ++i) {
+        await action();
 
-        // UNIX time [s] to UTC.
-        const dateTime = new Date(positions[i].timestamp * 1000);
-        if (dateTime >= startDateTime && dateTime <= endDateTime) {
+    } catch (err) {
 
-            const lat = fixPrecision(positions[i].estimated_lat, 6);
-            const lng = fixPrecision(positions[i].estimated_lng, 6);
-            const confidence = fixPrecision(positions[i].estimated_horizontal_error, 1);
-            const temperature = fixPrecision(positions[i].temperature, 1);
-            const battery = fixPrecision(positions[i].battery, 2);
-
-            rows.push([dateTime.toISOString(), lat, lng, confidence, temperature, battery, i]);
-
-        }
+        console.error(err);
+        processingWarningDisplay.style.display = '';
+        processingWarningText.innerHTML = 'Could not download the result. ' +
+            err.message + ' The full result may no longer be available.';
 
     }
-
-    const csvContent = 'data:text/csv;charset=utf-8,' + rows.map(e => e.join(',')).join('\n');
-
-    createDownloadLink(csvContent, uploadID + '.csv');
-
-});
-
-downloadJSONButton.addEventListener('click', () => {
-
-    const elements = [];
-    // Loop over all data and add rows to JSON object.
-    for (let i = 0; i < positions.length; ++i) {
-
-        const dateTime = new Date(positions[i].timestamp * 1000);
-
-        if (dateTime >= startDateTime && dateTime <= endDateTime) {
-
-            elements.push({
-
-                // UNIX time [s] to UTC.
-                datetime: dateTime.toISOString(),
-
-                latitude: positions[i].estimated_lat,
-                longitude: positions[i].estimated_lng,
-
-                confidence: positions[i].estimated_horizontal_error,
-                temperature: positions[i].temperature,
-                battery: positions[i].battery,
-
-                id: i
-
-            });
-
-        }
-
-    }
-
-    const jsonContent = 'data:text/json;charset=utf-8,' + JSON.stringify(elements, null, 4);
-
-    createDownloadLink(jsonContent, uploadID + '.json');
-
-});
-
-/**
- * Convert markers layer into GeoJSON object.
- *
- * Populate default 'coordinates' fields.
- * Add custom 'timestamp' property.
- *
- * @return {GeoJSON}  json object.
- */
-function getGeoJson() {
-
-    const json = markersLayer.toGeoJSON();
-    // Loop over all data to add timestamps.
-    let j = 0; // Index for json elements
-    for (let i = 0; i < positions.length; ++i) {
-
-        // UNIX time [s] to UTC.
-        var date = new Date(positions[i].timestamp * 1000);
-        if (date >= startDateTime && date <= endDateTime) {
-
-            // Add timestamp, temperature, and battery property.
-            json.features[j].properties.timestamp = date.toISOString();
-            json.features[j].properties.confidence = positions[i].estimated_horizontal_error;
-            json.features[j].properties.temperature = positions[i].temperature;
-            json.features[j].properties.battery = positions[i].battery;
-            // Add ID property.
-            json.features[j++].properties.id = i;
-
-        }
-
-    }
-    return json;
 
 }
 
+// Download buttons for the upload records as CSV, GeoJSON, JSON or KML file.
+// CSV and GeoJSON are downloaded from the result objects in Cloud Storage
+// (results/{uploadId}/positions.csv.gz and positions.geojson.gz) and
+// decompressed in the browser. KML and JSON are generated client-side from
+// the full GeoJSON result object, exactly like before.
+
+/**
+ * Download data as .csv file.
+ */
+downloadCSVButton.addEventListener('click', () => {
+
+    downloadWithErrorHandling(async () => {
+
+        const blob = await fetchResultBlob(uploadID, 'positions.csv.gz');
+        const plain = await gunzipBlob(blob);
+
+        downloadBlob(plain, uploadID + '.csv');
+
+    });
+
+});
+
 /**
  * Download data as .json file (GeoJSON format).
- *
- * Populate default 'coordinates' fields.
- * Add custom 'timestamp' property.
  */
-downloadGeoJSONButton.onclick = async () => {
+downloadGeoJSONButton.addEventListener('click', () => {
 
-    // Convert marker layer to json object and json object to string.
-    const jsonStr = 'data:text/csv;charset=utf-8,' + JSON.stringify(getGeoJson(), null, 4);
+    downloadWithErrorHandling(async () => {
 
-    // Provide download.
-    createDownloadLink(jsonStr, uploadID + '.json');
+        const blob = await fetchResultBlob(uploadID, 'positions.geojson.gz');
+        const plain = await gunzipBlob(blob);
 
-};
+        downloadBlob(plain, uploadID + '.json');
 
+    });
+
+});
+
+/**
+ * Download data as .json file.
+ */
+downloadJSONButton.addEventListener('click', () => {
+
+    downloadWithErrorHandling(async () => {
+
+        const fullPositions = await loadFullPositions();
+
+        const elements = [];
+        // Loop over all data and add rows to JSON object.
+        for (let i = 0; i < fullPositions.length; ++i) {
+
+            const dateTime = new Date(fullPositions[i].timestamp * 1000);
+
+            if (dateTime >= startDateTime && dateTime <= endDateTime) {
+
+                elements.push({
+
+                    // UNIX time [s] to UTC.
+                    datetime: dateTime.toISOString(),
+
+                    latitude: fullPositions[i].estimated_lat,
+                    longitude: fullPositions[i].estimated_lng,
+
+                    confidence: fullPositions[i].estimated_horizontal_error,
+                    temperature: fullPositions[i].temperature,
+                    battery: fullPositions[i].battery,
+
+                    id: i
+
+                });
+
+            }
+
+        }
+
+        const jsonContent = 'data:text/json;charset=utf-8,' + JSON.stringify(elements, null, 4);
+
+        createDownloadLink(jsonContent, uploadID + '.json');
+
+    });
+
+});
+
+/**
+ * Download data as .kml file.
+ */
 downloadKMLButton.addEventListener('click', () => {
 
-    let kmlContent = 'data:text/kml;charset=utf-8,';
+    downloadWithErrorHandling(async () => {
 
-    kmlContent += '<?xml version="1.0" encoding="UTF-8"?>\n';
-    kmlContent += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
-    kmlContent += '\t<Document>\n';
-    kmlContent += '\t<name>SnapperGPS track ' + uploadID + '</name>\n';
-    // TODO: Add description, e.g., link to website
-    kmlContent += '\t<description></description>\n';
+        const fullPositions = await loadFullPositions();
 
-    for (let i = 0; i < positions.length; ++i) {
+        let kmlContent = 'data:text/kml;charset=utf-8,';
 
-        // Check if point is valid.
-        let lat, lng;
-        if (isPositionValid(positions[i])) {
-            lat = fixPrecision(positions[i].estimated_lat, 6);
-            lng = fixPrecision(positions[i].estimated_lng, 6);
-        } else {
-            lat = 0;
-            lng = 0;
+        kmlContent += '<?xml version="1.0" encoding="UTF-8"?>\n';
+        kmlContent += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
+        kmlContent += '\t<Document>\n';
+        kmlContent += '\t<name>SnapperGPS track ' + uploadID + '</name>\n';
+        // TODO: Add description, e.g., link to website
+        kmlContent += '\t<description></description>\n';
+
+        for (let i = 0; i < fullPositions.length; ++i) {
+
+            // Check if point is valid.
+            let lat, lng;
+            if (isPositionValid(fullPositions[i])) {
+                lat = fixPrecision(fullPositions[i].estimated_lat, 6);
+                lng = fixPrecision(fullPositions[i].estimated_lng, 6);
+            } else {
+                lat = 0;
+                lng = 0;
+            }
+
+            const dt = new Date(fullPositions[i].timestamp * 1000);
+
+            if (dt >= startDateTime && dt <= endDateTime) {
+
+                const confidence = fixPrecision(fullPositions[i].estimated_horizontal_error, 1);
+                const temperature = fixPrecision(fullPositions[i].temperature, 1);
+                const battery = fixPrecision(fullPositions[i].battery, 2);
+
+                kmlContent += '\t\t<Placemark>\n';
+                kmlContent += '\t\t\t<name>' + i.toString() + '</name>\n';
+                kmlContent += '\t\t\t<ExtendedData>\n';
+                kmlContent += '\t\t\t\t<Data name="confidence">\n';
+                kmlContent += '\t\t\t\t\t<value>' + confidence + '</value>\n';
+                kmlContent += '\t\t\t\t</Data>\n';
+                kmlContent += '\t\t\t\t<Data name="temperature">\n';
+                kmlContent += '\t\t\t\t\t<value>' + temperature + '</value>\n';
+                kmlContent += '\t\t\t\t</Data>\n';
+                kmlContent += '\t\t\t\t<Data name="battery">\n';
+                kmlContent += '\t\t\t\t\t<value>' + battery + '</value>\n';
+                kmlContent += '\t\t\t\t</Data>\n';
+                kmlContent += '\t\t\t</ExtendedData>\n';
+                kmlContent += '\t\t\t<TimeStamp>\n';
+                kmlContent += '\t\t\t\t<when>' + dt.toISOString() + '</when>\n';
+                kmlContent += '\t\t\t</TimeStamp>\n';
+                kmlContent += '\t\t\t<Point>\n';
+                kmlContent += '\t\t\t\t<coordinates>' + lng + ',' + lat + '</coordinates>\n';
+                kmlContent += '\t\t\t</Point>\n';
+                kmlContent += '\t\t</Placemark>\n';
+
+            }
+
         }
 
-        const dt = new Date(positions[i].timestamp * 1000);
+        kmlContent += '\t</Document>\n';
+        kmlContent += '</kml>';
 
-        if (dt >= startDateTime && dt <= endDateTime) {
+        createDownloadLink(kmlContent, uploadID + '.kml');
 
-            const confidence = fixPrecision(positions[i].estimated_horizontal_error, 1);
-            const temperature = fixPrecision(positions[i].temperature, 1);
-            const battery = fixPrecision(positions[i].battery, 2);
-
-            kmlContent += '\t\t<Placemark>\n';
-            kmlContent += '\t\t\t<name>' + i.toString() + '</name>\n';
-            kmlContent += '\t\t\t<ExtendedData>\n';
-            kmlContent += '\t\t\t\t<Data name="confidence">\n';
-            kmlContent += '\t\t\t\t\t<value>' + confidence + '</value>\n';
-            kmlContent += '\t\t\t\t</Data>\n';
-            kmlContent += '\t\t\t\t<Data name="temperature">\n';
-            kmlContent += '\t\t\t\t\t<value>' + temperature + '</value>\n';
-            kmlContent += '\t\t\t\t</Data>\n';
-            kmlContent += '\t\t\t\t<Data name="battery">\n';
-            kmlContent += '\t\t\t\t\t<value>' + battery + '</value>\n';
-            kmlContent += '\t\t\t\t</Data>\n';
-            kmlContent += '\t\t\t</ExtendedData>\n';
-            kmlContent += '\t\t\t<TimeStamp>\n';
-            kmlContent += '\t\t\t\t<when>' + dt.toISOString() + '</when>\n';
-            kmlContent += '\t\t\t</TimeStamp>\n';
-            kmlContent += '\t\t\t<Point>\n';
-            kmlContent += '\t\t\t\t<coordinates>' + lng + ',' + lat + '</coordinates>\n';
-            kmlContent += '\t\t\t</Point>\n';
-            kmlContent += '\t\t</Placemark>\n';
-
-        }
-
-    }
-
-    kmlContent += '\t</Document>\n';
-    kmlContent += '</kml>';
-
-    createDownloadLink(kmlContent, uploadID + '.kml');
+    });
 
 });
 
@@ -728,13 +798,18 @@ smoothInput.addEventListener('change', () => {
         positions = JSON.parse(JSON.stringify(raw_positions));
     } else {
 
-        const reference_latlon = new LatLon(referencePoints[0].lat, referencePoints[0].lng, 0.0);
-
         let firstPlausiblePositionIdx = 0;
         while (!isPositionPlausible(raw_positions[firstPlausiblePositionIdx]) && firstPlausiblePositionIdx < positions.length) { ++firstPlausiblePositionIdx };
         console.log('First plausible position at index ' + firstPlausiblePositionIdx + '.');
 
         if (firstPlausiblePositionIdx < positions.length) {
+
+            // Reference point for the smoothing (falls back to the first
+            // plausible position if no user-provided reference point exists).
+            const reference_latlon = (referencePoints && referencePoints.length > 0)
+                ? new LatLon(referencePoints[0].lat, referencePoints[0].lng, 0.0)
+                : new LatLon(raw_positions[firstPlausiblePositionIdx].estimated_lat,
+                             raw_positions[firstPlausiblePositionIdx].estimated_lng, 0.0);
 
             // State transition
             const F = 1.0;
@@ -902,19 +977,77 @@ L.control.scale({ position: 'bottomleft' }).addTo(map);
 
 console.log('Loading upload ID', uploadID);
 
-// Request upload information from server
+// No upload ID in the URL: nothing to show.
+if (!uploadID) {
 
-getInformation(() => {
+    processingWarningDisplay.style.display = '';
+    processingWarningText.innerHTML = 'Please enter an upload ID to view your track.';
+    downloadSpinner.style.display = 'none';
 
-    populateFields();
+} else {
 
-    // Fill map with processed positions (if any exist)
+    // Request upload information from Firestore
+    getInformation(async (upload) => {
 
-    getPositions(uploadID, (positionRes) => {
+        if (!upload) {
 
-        positions = JSON.parse(positionRes).positions;
+            // The upload does not exist or is not accessible from this
+            // browser: redirect to the search page with the old error message.
+            window.location.href = 'search.html?error=' + encodeURIComponent(uploadID);
+            return;
+
+        }
+
+        populateFields();
+
+        // Fill map with processed positions (if any exist)
+
+        if (upload.status === 'failed') {
+
+            processingWarningDisplay.style.display = '';
+            processingWarningText.innerHTML = 'Processing of your upload failed. ' +
+                (upload.errorMessage || 'Please try uploading the data again.');
+            downloadSpinner.style.display = 'none';
+            return;
+
+        }
+
+        if (upload.status !== 'complete') {
+
+            processingWarningDisplay.style.display = '';
+            processingWarningText.innerHTML = 'SnapperGPS has not processed your snapshots yet. ' +
+                'Please check back later.';
+            downloadSpinner.style.display = 'none';
+            return;
+
+        }
+
+        // Load the preview track from Cloud Storage
+        // (results/{uploadId}/preview.geojson).
+        let previewPositions;
+
+        try {
+
+            previewPositions = await loadPreviewPositions();
+
+        } catch (err) {
+
+            // The result objects may have expired (see retention policy).
+            console.warn(err);
+            processingWarningDisplay.style.display = '';
+            processingWarningText.innerHTML = 'The full result of this upload is no longer available. ' +
+                'The metadata is still shown below.';
+            downloadSpinner.style.display = 'none';
+            return;
+
+        }
+
+        positions = previewPositions;
 
         processedPositionCount = positions.length;
+
+        // Remember raw positions for the smoothing feature
+        raw_positions = JSON.parse(JSON.stringify(previewPositions));
 
         const disableButtons = (processedPositionCount === null ||
                                 processedPositionCount === 0);
@@ -953,41 +1086,34 @@ getInformation(() => {
         if (processedPositionCount === null || processedPositionCount === 0) {
             processingWarningDisplay.style.display = '';
             // Check if all snapshots where not in the selected date range
-            getFirstLastSnapshotTimestamps(uploadID, (timestampsRes) => {
-                const snapshotTimestamps = JSON.parse(timestampsRes);
-                const snapshotStartDt = new Date(snapshotTimestamps.startDatetime);
-                const snapshotEndDt = new Date(snapshotTimestamps.endDatetime);
-                // Check if start and end point are available
-                if (referencePoints.length > 1) {
-                    const selectedStartDt = new Date(referencePoints[0].dt);
-                    const selectedEndDt = new Date(referencePoints[1].dt);
-                    if (snapshotStartDt <= selectedEndDt && snapshotEndDt >= selectedStartDt) {
-                        // Selected range is good -> snapshots just have not been processed yet
-                        processingWarningText.innerHTML = 'SnappperGPS has not processed your snapshots yet.';
-                    } else {
-                        // Selected range is bad
-                        processingWarningText.innerHTML = 'None of your uploaded snapshots falls into your selected time range. ' +
-                            'You selected ' +
-                            (selectedStartDt).toString().replace('GMT', 'UTC') +
-                            ' as start time and ' +
-                            (selectedEndDt).toString().replace('GMT', 'UTC') +
-                            ' as end time, but your snapshots were captured between ' +
-                            (snapshotStartDt).toString().replace('GMT', 'UTC') +
-                            ' and ' +
-                            (snapshotEndDt).toString().replace('GMT', 'UTC') +
-                            '.';
-                    }
+            const snapshotStartDt = upload.earliestSnapshotTime ? new Date(upload.earliestSnapshotTime) : null;
+            const snapshotEndDt = upload.latestSnapshotTime ? new Date(upload.latestSnapshotTime) : null;
+            // Check if start and end point are available
+            if (referencePoints.length > 1) {
+                const selectedStartDt = new Date(referencePoints[0].dt);
+                const selectedEndDt = new Date(referencePoints[1].dt);
+                if (snapshotStartDt && snapshotEndDt && snapshotStartDt <= selectedEndDt && snapshotEndDt >= selectedStartDt) {
+                    // Selected range is good -> snapshots just have not been processed yet
+                    processingWarningText.innerHTML = 'SnapperGPS has not processed your snapshots yet.';
                 } else {
-                    // Start and/or end point are missing -> incomplete upload
-                    processingWarningText.innerHTML = 'Your data upload did not complete. Please try again.';
+                    // Selected range is bad
+                    processingWarningText.innerHTML = 'None of your uploaded snapshots falls into your selected time range. ' +
+                        'You selected ' +
+                        (selectedStartDt).toString().replace('GMT', 'UTC') +
+                        ' as start time and ' +
+                        (selectedEndDt).toString().replace('GMT', 'UTC') +
+                        ' as end time, but your snapshots were captured between ' +
+                        (snapshotStartDt ? (snapshotStartDt).toString().replace('GMT', 'UTC') : '?') +
+                        ' and ' +
+                        (snapshotEndDt ? (snapshotEndDt).toString().replace('GMT', 'UTC') : '?') +
+                        '.';
                 }
-
-            })
+            } else {
+                // Start and/or end point are missing -> incomplete upload
+                processingWarningText.innerHTML = 'Your data upload did not complete. Please try again.';
+            }
         }
-
-        // Remember raw positions from database
-        raw_positions = JSON.parse(positionRes).positions;
 
     });
 
-});
+}

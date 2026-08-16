@@ -1,0 +1,73 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uploadExists(uploadId) {
+      return firestore.exists(
+        /databases/(default)/documents/uploads/$(uploadId)
+      );
+    }
+
+    function uploadDoc(uploadId) {
+      return firestore.get(
+        /databases/(default)/documents/uploads/$(uploadId)
+      );
+    }
+
+    function ownsUpload(uploadId) {
+      return signedIn()
+        && uploadExists(uploadId)
+        && uploadDoc(uploadId).data.uid == request.auth.uid;
+    }
+
+    match /uploads/{uploadId}/raw.snapper.json.gz {
+      allow write: if ownsUpload(uploadId)
+        && uploadDoc(uploadId).data.status in ["created", "uploading"]
+        && uploadDoc(uploadId).data.snapshotCount <= 50000
+        && request.resource.size > 0
+        && request.resource.size <= 150 * 1024 * 1024
+        && request.resource.contentType in [
+          "application/gzip",
+          "application/x-gzip",
+          "application/octet-stream"
+        ];
+
+      allow read: if ownsUpload(uploadId);
+    }
+
+    match /uploads/{uploadId}/raw.sha256.txt {
+      allow write: if ownsUpload(uploadId)
+        && uploadDoc(uploadId).data.status in ["created", "uploading"]
+        && request.resource.size > 0
+        && request.resource.size <= 256;
+
+      allow read: if ownsUpload(uploadId);
+    }
+
+    match /results/{uploadId}/{fileName} {
+      allow read: if ownsUpload(uploadId)
+        && uploadDoc(uploadId).data.status == "complete"
+        && fileName in [
+          "positions.csv.gz",
+          "positions.geojson.gz",
+          "preview.geojson",
+          "summary.json"
+        ];
+
+      allow write: if false;
+    }
+
+    match /tmp/{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

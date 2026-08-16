@@ -799,5 +799,3 @@ if (!navigator.usb) {
     connectToDevice(true);
 
 }
-
-updateCache();

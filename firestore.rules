@@ -1,0 +1,60 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /quotaDaily/{day} {
+      allow read, write: if false;
+    }
+
+    match /quotaMonthly/{month} {
+      allow read, write: if false;
+    }
+
+    match /uploads/{uploadId} {
+      allow create: if false;
+
+      allow read: if isOwner();
+
+      allow update: if isOwner()
+        && resource.data.status in ["created", "uploading"]
+        && request.resource.data.diff(resource.data).changedKeys()
+          .hasOnly([
+            "status",
+            "uploadedAt",
+            "rawGzipBytes",
+            "rawSha256"
+          ])
+        && request.resource.data.status in ["uploading", "waiting"]
+        && request.resource.data.rawGzipBytes is int
+        && request.resource.data.rawGzipBytes > 0
+        && request.resource.data.rawGzipBytes <= 150 * 1024 * 1024;
+
+      allow delete: if false;
+
+      match /referencePoints/{referencePointId} {
+        allow create: if signedIn()
+          && exists(/databases/$(database)/documents/uploads/$(uploadId))
+          && get(/databases/$(database)/documents/uploads/$(uploadId)).data.uid == request.auth.uid
+          && get(/databases/$(database)/documents/uploads/$(uploadId)).data.status == "created"
+          && request.resource.data.lat is number
+          && request.resource.data.lng is number
+          && request.resource.data.datetime is timestamp;
+
+        allow read: if signedIn()
+          && exists(/databases/$(database)/documents/uploads/$(uploadId))
+          && get(/databases/$(database)/documents/uploads/$(uploadId)).data.uid == request.auth.uid;
+
+        allow update, delete: if false;
+      }
+    }
+  }
+}

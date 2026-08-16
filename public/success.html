@@ -9,10 +9,36 @@
     </head>
     <body>
 
-        <div style="display: none;" id="upload-id" value="<%= uploadID %>"></div>
+        <div style="display: none;" id="upload-id"></div>
 
         <!-- Nav bar -->
-        <%- include ('partials/navBar', {pageName: 'upload'}) %>
+        <nav class="navbar navbar-expand navbar-dark bg-dark fixed-top">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="index.html">
+            <span class="full-text">SnapperGPS</span>
+            <span class="short-text">S</span>
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navbarNav">
+            <ul class="navbar-nav">
+                <li class="nav-item">
+                    <a class="nav-link" href="configure.html">Configure
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link active" aria-current="page" href="upload.html">Upload
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link" href="view.html">Download
+                    </a>
+                </li>
+            </ul>
+        </div>
+    </div>
+</nav>
 
         <!-- Main body -->
         <main class="container">
@@ -30,14 +56,14 @@
                             SnapperGPS receiver to the server.</p>
                         <p>Once processing is complete,
                             the estimated locations will be available by searching
-                            for the upload ID <a class="text-link" href="/view?uploadid=<%= uploadID %>"><%= uploadID %></a>.</p>
+                            for the upload ID <a class="text-link" id="view-upload-link" href="view.html">-</a>.</p>
                         <p id="notification-info">If you requested a push notification, then
                             we will send you one when we are done.</p>
                         <p id="email-info">If you provided an e-mail address, then we will
                             notify you when we are done.</p>
                         <p>You can also send your upload ID to our
                             Telegram bot
-                            <a class="text-link" href="https://t.me/SnapperGPSBot?start=<%= uploadID %>">@SnapperGPSBot</a>
+                            <a class="text-link" id="telegram-bot-link" href="https://t.me/SnapperGPSBot">@SnapperGPSBot</a>
                             for updates about the processing progress.</p>
                     </div>
                 </div>
@@ -46,7 +72,7 @@
 
             <div class="row">
                 <div class="col">
-                    <a class="text-link" href="/upload">Back</a>
+                    <a class="text-link" href="upload.html">Back</a>
                 </div>
             </div>
 
@@ -58,8 +84,14 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta2/dist/js/bootstrap.bundle.min.js" integrity="sha384-b5kHyXgcpbZJO/tY9Ul7kGkf1S0CWuKcCD38l8YkeH8z8QjE0GmW1gYU5S9FOnJ0" crossorigin="anonymous"></script>
     <script>
         const url = new URL(window.location.href);
+        const uploadID = url.searchParams.get("uploadid");
+        if (uploadID !== null) {
+            document.getElementById("view-upload-link").href = "view.html?uploadid=" + uploadID;
+            document.getElementById("view-upload-link").textContent = uploadID;
+            document.getElementById("telegram-bot-link").href = "https://t.me/SnapperGPSBot?start=" + uploadID;
+        }
         const email = url.searchParams.get("email");
-        if (email.indexOf('@') > -1) {
+        if (email !== null && email.indexOf('@') > -1) {
             document.getElementById("email-info").innerHTML
                 = "We will send an email with the link to <b><i>" + email + "</i></b> when processing is complete.";
         } else {
@@ -76,4 +108,5 @@
         }
     </script>
 
+    <script src="js/pwa.js"></script>
 </html>
