@@ -117,6 +117,14 @@ selected date range), exactly like the old app. It loads
 therefore not required to be a subsample; the migration script writes the
 full positions into it as well.
 
+**Legacy result files.** Result files written by older processors may use
+the property name `l_error` instead of `estimated_horizontal_error`, and may
+contain non-standard JSON tokens (`Infinity`, `-Infinity`, `NaN`) for
+unavailable estimates. The download page accepts both property names and
+sanitises those tokens to `null` before parsing; `migrate_tracks.py` never
+writes them (it blanks non-finite values and serialises with
+`allow_nan=False`).
+
 **Bucket CORS.** The download page reads the result objects with `fetch()`
 from the browser origin (GitHub Pages). Cloud Storage does not send
 `Access-Control-Allow-Origin` headers unless a CORS configuration exists on

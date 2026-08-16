@@ -200,12 +200,16 @@ function geojsonToPositions(geojson) {
         const coordinates = geometry.coordinates || [];
         const props = feature.properties || {};
 
+        // Older processors name the position uncertainty "l_error" instead
+        // of "estimated_horizontal_error"; accept both.
+        const rawError = (props.estimated_horizontal_error === undefined || props.estimated_horizontal_error === null)
+            ? props.l_error : props.estimated_horizontal_error;
+
         positions.push({
             estimated_lat: coordinates[1],
             estimated_lng: coordinates[0],
             timestamp: Date.parse(props.datetime) / 1000,
-            estimated_horizontal_error: (props.estimated_horizontal_error === undefined || props.estimated_horizontal_error === null)
-                ? null : props.estimated_horizontal_error,
+            estimated_horizontal_error: (rawError === undefined || rawError === null) ? null : rawError,
             temperature: props.temperature,
             battery: props.battery,
             id: props.snapshot_index
@@ -230,7 +234,7 @@ async function loadPreviewPositions() {
 
     const blob = await fetchResultBlob(uploadID, 'preview.geojson');
     const text = await blob.text();
-    const geojson = JSON.parse(text);
+    const geojson = parseResultJson(text);
 
     return geojsonToPositions(geojson);
 
@@ -239,6 +243,20 @@ async function loadPreviewPositions() {
 // Cache of the full positions (used for the map and the KML/JSON download
 // buttons), so the large result object is downloaded at most once per page.
 let fullPositionsCache = null;
+
+/**
+ * Parse result GeoJSON. Result files written by older processors may
+ * contain non-standard JSON tokens ("Infinity", "-Infinity", "NaN") for
+ * unavailable estimates (e.g. a position error that could not be computed).
+ * These are not valid JSON, so they are sanitised to null before parsing.
+ * @param {string} text Raw result file text.
+ * @returns {Object} Parsed GeoJSON document.
+ */
+function parseResultJson(text) {
+
+    return JSON.parse(text.replace(/-?Infinity|NaN/g, 'null'));
+
+}
 
 /**
  * Download and parse the FULL result object
@@ -256,7 +274,7 @@ async function loadFullPositions() {
     const blob = await fetchResultBlob(uploadID, 'positions.geojson.gz');
     const plain = await gunzipBlob(blob);
     const text = await plain.text();
-    const geojson = JSON.parse(text);
+    const geojson = parseResultJson(text);
 
     fullPositionsCache = geojsonToPositions(geojson);
 
