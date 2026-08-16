@@ -37,6 +37,8 @@ service firebase.storage {
           "application/octet-stream"
         ];
 
+      // Raw snapshot data stays private (owner-only); only the processed
+      // results (below) are publicly viewable.
       allow read: if ownsUpload(uploadId);
     }
 
@@ -50,8 +52,9 @@ service firebase.storage {
     }
 
     match /results/{uploadId}/{fileName} {
-      allow read: if ownsUpload(uploadId)
-        && uploadDoc(uploadId).data.status == "complete"
+      // Processed tracks are publicly viewable once processing is complete,
+      // like the old view-by-upload-ID behaviour.
+      allow read: if uploadDoc(uploadId).data.status == "complete"
         && fileName in [
           "positions.csv.gz",
           "positions.geojson.gz",

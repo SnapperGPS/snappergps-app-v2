@@ -20,9 +20,13 @@ service cloud.firestore {
     }
 
     match /uploads/{uploadId} {
+      // Tracks are publicly viewable with the upload ID, like the old
+      // view-by-upload-ID behaviour. Only writes stay restricted: the
+      // quota gate creates the document and the owner may update a narrow
+      // set of fields while uploading.
       allow create: if false;
 
-      allow read: if isOwner();
+      allow read: if true;
 
       allow update: if isOwner()
         && resource.data.status in ["created", "uploading"]
@@ -49,9 +53,7 @@ service cloud.firestore {
           && request.resource.data.lng is number
           && request.resource.data.datetime is timestamp;
 
-        allow read: if signedIn()
-          && exists(/databases/$(database)/documents/uploads/$(uploadId))
-          && get(/databases/$(database)/documents/uploads/$(uploadId)).data.uid == request.auth.uid;
+        allow read: if true;
 
         allow update, delete: if false;
       }

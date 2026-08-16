@@ -222,11 +222,18 @@ lease window back into the quota counters).
 - **No GitHub Actions workflow**: there is no build step. GitHub Pages is
   configured with *Deploy from a branch* → folder `/public`. If a workflow
   is ever wanted, `npm ci && npm run build` does not apply here (no NPM).
-- **Viewing uploads requires the same browser session** (anonymous uid) that
-  created them, because `firestore.rules` allow read only for the owner.
-  Search-by-upload-ID from a different browser/device needs a server-side
-  rule extension that verifies the `readSecret` field; the front end already
-  stores the secret in the upload document.
+- **Viewing uploads is public**, like the old view-by-upload-ID behaviour:
+  `firestore.rules` / `storage.rules` allow anyone to read upload metadata
+  and reference points, and to download the processed result objects once
+  `status == "complete"`. The raw upload object (`uploads/{uploadId}/raw.snapper.json.gz`)
+  and the raw checksum remain readable only by the upload owner (anonymous
+  uid); the `tmp/` prefix and the quota documents stay fully denied.
+  Consequence: the upload document also contains the notification fields
+  (`email`, `chatId`, `pushSubscription`) and `readSecret`, which are
+  readable by anyone with the upload ID. If those must stay private, move
+  them into a separate private subcollection (e.g.
+  `uploads/{uploadId}/private`) and have the processor read them from
+  there; the front end and the quota gate would need a matching change.
 
 ---
 
