@@ -6,7 +6,7 @@ It is the companion app for your SnapperGPS receiver.
 Use it to configure your SnapperGPS receiver for your next deployment
 and to process the collected data after a completed deployment.
 
-Find the remainder of the back end in [the *snappergps-backend* repository](https://github.com/SnapperGPS/snappergps-backend/).
+Find the remainder of the back end in [the *snappergps-backend* repository](https://github.com/SnapperGPS/snappergps-backend-v2/).
 
 ### Table of contents
 
