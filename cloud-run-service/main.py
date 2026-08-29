@@ -14,7 +14,7 @@ firebase_admin.initialize_app()
 db = firestore.client()
 
 ALLOWED_ORIGINS = {
-    "https://snappergps.github.io/",
+    "https://snappergps.github.io",
     "https://snappergps.info"
 }
 
@@ -32,20 +32,31 @@ MAX_CLASS_B_ESTIMATE_PER_MONTH = 40000
 
 
 def make_response(request, body, status=200):
-    origin = request.headers.get("Origin", "")
+    # The Origin header never contains a trailing slash; normalise both
+    # sides so an entry like "https://snappergps.github.io/" cannot
+    # silently stop matching the browser's "https://snappergps.github.io".
+    origin = (request.headers.get("Origin", "") or "").rstrip("/")
+    # A 204 response (the CORS preflight) must not carry a body: the fetch
+    # spec treats a 204 with a non-empty body as a network error.
+    body_text = "" if status == 204 else json.dumps(body)
     response = Response(
-        json.dumps(body),
+        body_text,
         status=status,
         mimetype="application/json"
     )
 
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
-
-    response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-    response.headers["Access-Control-Max-Age"] = "3600"
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        # The browser's preflight lists every header the client's fetch()
+        # sets. quota.js sends Content-Type and Authorization and, when App
+        # Check is enabled, X-Firebase-AppCheck; all must be allowed or the
+        # preflight fails even with a valid Access-Control-Allow-Origin.
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Authorization, Content-Type, X-Firebase-AppCheck"
+        )
+        response.headers["Access-Control-Max-Age"] = "3600"
     return response
 
 
@@ -133,6 +144,9 @@ def reserve_upload_slot(request):
     try:
         data = request.get_json(force=True) or {}
     except Exception:
+        return make_response(request, {"error": "Invalid JSON"}, 400)
+
+    if not isinstance(data, dict):
         return make_response(request, {"error": "Invalid JSON"}, 400)
 
     snapshot_count = data.get("snapshotCount")
