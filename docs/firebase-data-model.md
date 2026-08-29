@@ -256,6 +256,13 @@ lease window back into the quota counters).
   otherwise identical to the design document. The browser sends the Firebase
   ID token as `Authorization: Bearer <token>` and the App Check token as
   `X-Firebase-AppCheck` (when App Check is enabled).
+  **The Cloud Run service must handle CORS itself** — Cloud Run does not add
+  `Access-Control-Allow-Origin` headers automatically, so every response
+  (including the `OPTIONS` preflight) must carry `Access-Control-Allow-Origin`,
+  and the preflight must allow the method `POST` and the request headers
+  `Content-Type`, `Authorization`, `X-Firebase-AppCheck`. Without this, the
+  browser blocks the request and the upload page shows "Could not reach the
+  upload server".
 - **App Check is only initialised when a reCAPTCHA Enterprise site key is
   configured** (`RECAPTCHA_ENTERPRISE_SITE_KEY` in `public/js/config.js`).
   While App Check is in monitor mode, the app runs without it.

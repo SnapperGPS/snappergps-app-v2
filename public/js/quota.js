@@ -118,7 +118,22 @@ async function reserveUploadSlot(input) {
 
     } catch (err) {
 
-        throw new Error('Could not reach the upload server. Please check your internet connection and try again.');
+        // A TypeError means the request itself never completed: the browser
+        // blocked reading the response (CORS) or there is no connectivity.
+        // Cloud Run does not add CORS headers automatically, so a missing
+        // CORS configuration on the quota gate surfaces here (see
+        // docs/firebase-data-model.md). Timeouts (AbortError) keep the
+        // generic connection message.
+        console.warn('Quota gate request failed:', err);
+
+        const blockedByCors = (err instanceof TypeError);
+
+        throw new Error(blockedByCors
+            ? 'Could not reach the upload server. This is usually caused by a ' +
+              'missing CORS configuration on the upload server (Cloud Run) or ' +
+              'by being offline.'
+            : 'Could not reach the upload server. Please check your internet ' +
+              'connection and try again.');
 
     }
 
