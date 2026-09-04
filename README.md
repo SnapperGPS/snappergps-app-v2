@@ -1,6 +1,6 @@
 # snappergps-app
 
-This repository contains the front end of [the SnapperGPS web application](https://github.com/SnapperGPS/snappergps-app-v2).
+This repository contains the front end of [the SnapperGPS web application](https://snappergps.github.io/snappergps-app-v2/public/).
 
 It is the companion app for your SnapperGPS receiver.
 Use it to configure your SnapperGPS receiver for your next deployment
